@@ -1,0 +1,81 @@
+From 3e9a15491e8a3b9881593d850a914c226205d6ef Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Mon, 23 Nov 2026 21:03:30 +0000
+Subject: [PATCH] fix: apresenta PCIE 6.0.1 como 6.0.0 e SMUIO 13.0.9 como
+ 13.0.1 ao HWLibs
+
+No 15.8.1 so cinco funcoes do HWLibs comparam a versao do bloco (as que
+chamam get_hw_revision: bif, mp0, sem, pcie, smuio). Duas versoes da
+Mendocino nao tem caso e derrubam bgm_create:
+- PCIE 6.0.1: _pcie_ip_create devolve 1, bio_create falha, evento
+  0xc00c0204 (visto na 610M: bgm_create unsuccessful, ttl_initialize = 4).
+- SMUIO 13.0.9: _smuio_ip_create devolveria 1, evento 0xc00c0207.
+A versao e trocada so numa copia do registro de 0x260 bytes, como o
+gancho do MP0 ja faz. PCIE vira 6.0.0; SMUIO vira 13.0.1, que no Linux
+usa as mesmas funcoes da 13.0.9 (smuio_v11_0_6_funcs).
+---
+ src/RembrandtGfx/kern_start.cpp | 41 +++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index d601022..68627a7 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -547,6 +547,45 @@ static uint64_t wrap_pcie_ip_sw_init(uint64_t, uint64_t, uint64_t, uint64_t, uin
+ 	return 0;
+ }
+ 
++// HWLibs' *_ip_create functions switch on the block's IP-discovery version. In 15.8.1 only five of them
++// do (the callers of get_hw_revision: bif, mp0, sem, pcie, smuio; read from SystemKernelExtensions.kc with
++// kc-le.py vers). Two of Mendocino's versions have no case there and make bgm_create fail:
++//   PCIE  (hw id 70)  6.0.1: _pcie_ip_create knows 3.6.0, 4.0.0, 4.1.0, 5.0.0-5.0.3, 5.1.0, 5.1.1, 6.0.0,
++//         6.5.0, 7.4.0 and 7.6.0. It returns 1, bio_create fails, bcs_log 0xc00c0204 (seen on the 610M:
++//         "Call to bgm_create was unsuccessful!", ttl_initialize = 4).
++//   SMUIO (hw id 4)  13.0.9: _smuio_ip_create knows 13.0.1, 13.0.6 and 13.0.7 in that family. It would
++//         return 1 and bgm_create would log 0xc00c0207.
++// Present each as the nearest version HWLibs has: PCIE 6.0.0 (same 6.0 line; selects the pcie4_1 table) and
++// SMUIO 13.0.1 (Linux gives 13.0.1 and 13.0.9 the same smuio_v11_0_6_funcs, amdgpu_discovery.c). As with
++// MP0 below, only a copy of the 0x260-byte entry is changed; both functions copy the entry they are given.
++// Entry: +0x8 major, +0xC minor, +0x10 revision.
++static uint64_t presentIpVersion(const char *name, mach_vm_address_t org, uint64_t ctx, uint64_t info, uint64_t out,
++	uint64_t d, uint64_t e, uint64_t f, uint32_t maj, uint32_t min, uint32_t rev, uint32_t asRev) {
++	uint8_t copy[0x260];
++	if (info) {
++		auto ip = reinterpret_cast<const uint32_t *>(info);
++		uint32_t m = ip[2] & 0xFFFF, n = ip[3] & 0xFFFF, r = ip[4] & 0xFFFF;
++		if (m == maj && n == min && r == rev) {
++			memcpy(copy, ip, sizeof(copy));
++			reinterpret_cast<uint32_t *>(copy)[4] = (ip[4] & ~0xFFFFu) | asRev;
++			info = reinterpret_cast<uint64_t>(copy);
++			LOG("%s: %u.%u.%u, presenting as %u.%u.%u", name, m, n, r, m, n, asRev);
++		} else {
++			LOG("%s: %u.%u.%u", name, m, n, r);
++		}
++	}
++	auto res = reinterpret_cast<Fn6>(org)(ctx, info, out, d, e, f);
++	LOG("%s = %llx", name, res & 0xFFFFFFFF);
++	return res;
++}
++static mach_vm_address_t org_pcie_ip_create, org_smuio_ip_create;
++static uint64_t wrap_pcie_ip_create(uint64_t ctx, uint64_t info, uint64_t out, uint64_t d, uint64_t e, uint64_t f) {
++	return presentIpVersion("pcie_ip_create", org_pcie_ip_create, ctx, info, out, d, e, f, 6, 0, 1, 0);
++}
++static uint64_t wrap_smuio_ip_create(uint64_t ctx, uint64_t info, uint64_t out, uint64_t d, uint64_t e, uint64_t f) {
++	return presentIpVersion("smuio_ip_create", org_smuio_ip_create, ctx, info, out, d, e, f, 13, 0, 9, 1);
++}
++
+ // DeviceCapabilityTbl is keyed by (device id, internal revision, external/PCI revision). All
+ // Navi 23 (0x73FF) rows have internal revision 0; Rembrandt reports its own, so no row matches.
+ // Look up the Navi 23 row with internal revision 0 and the real PCI revision.
+@@ -864,6 +903,8 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"_vbs_hw_init", wrap_vbs_hw_init, org_vbs_hw_init},
+ 		{"_psp_power_up_event", wrap_psp_power_up_event, org_psp_power_up_event},
+ 		{"_pcie_ip_sw_init", wrap_pcie_ip_sw_init},
++		{"_pcie_ip_create", wrap_pcie_ip_create, org_pcie_ip_create},
++		{"_smuio_ip_create", wrap_smuio_ip_create, org_smuio_ip_create},
+ 		{"_PEM_ExcuteEventChain", wrap_PEM_ExcuteEventChain},
+ 		{"_Phw_CommonDynamicState_ApplyClocksAdjustRules", wrap_ApplyClocksAdjustRules},
+ 		{"_get_hw_revision", wrap_get_hw_revision, org_get_hw_revision},
+-- 
+2.43.0
+

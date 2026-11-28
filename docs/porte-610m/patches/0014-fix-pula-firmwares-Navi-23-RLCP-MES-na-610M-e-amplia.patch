@@ -1,0 +1,64 @@
+From acf4db60b1bddc709b12d6660c6468d920a8bd4a Mon Sep 17 00:00:00 2001
+From: Roger Luft <rluft@pop.local>
+Date: Tue, 24 Nov 2026 09:59:09 -0800
+Subject: [PATCH 14/48] fix: pula firmwares Navi 23 (RLCP/MES) na 610M e amplia
+ espera/diagnostico de BOOTLOAD
+
+---
+ src/RembrandtGfx/firmware.cpp   |  4 ++++
+ src/RembrandtGfx/kern_start.cpp | 24 ++++++++++++++++++++----
+ 2 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index 3d5567b..c345905 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -207,6 +207,10 @@ uint64_t wrapPspPowerDown(uint64_t psp, uint64_t flags, uint64_t c, uint64_t d,
+ // numbering; the PSP failure event tag is this type). Skip Navi 23-only images Rembrandt lacks.
+ bool skipFwType(uint32_t type) {
+ 	switch (type) {
++		case 22:  // RLCP (Navi 23 RLC v2.4 only; Mendocino gc_10_3_7_rlc.bin is v2.2 with no RLCP)
++		case 9:   // CP MES (Navi 23 only; Mendocino GC 10.3.7 has no MES)
++		case 10:  // MES STACK (Navi 23 only; Mendocino GC 10.3.7 has no MES)
++			return gcHwVersion() == 0xa0307 && !checkKernelArgument("-rmbkeepn23fw");
+ 		case 30:  // global tap delays (Navi 23 RLC v2.4 only)
+ 		case 31:  // SE0 tap delays
+ 		case 32:  // SE1 tap delays
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 7f8d526..072b13b 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -780,10 +780,26 @@ static uint64_t wrap_gc_check_ucode_loaded_10_1(uint64_t gc, uint64_t b, uint64_
+ 	uint32_t grbm = mmioRead(0x1260 + 0x0da4);
+ 	LOG("gc_check_ucode_loaded: exit r=%llx; RLC_CNTL=%x RLC_STAT=%x BOOTLOAD=%x CP_STAT=%x GRBM=%x",
+ 	    r & 0xFFFFFFFF, rlcCntl, rlcStat, bootload, cpStat, grbm);
+-	if ((r & 0xFFFFFFFF) != 0 && (bootload & 0x80000000u) != 0 && bootload != 0xFFFFFFFFu) {
+-		LOG("gc_check_ucode_loaded: BOOTLOAD_COMPLETE=1 (bootload=%x rlc_stat=%x) -> returning 0 (Linux condition)",
+-		    bootload, rlcStat);
+-		return 0;
++	if ((r & 0xFFFFFFFF) != 0) {
++		for (int ms = 0; ms < 400 && ((bootload & 0x80000000u) == 0 || bootload == 0xFFFFFFFFu); ms += 10) {
++			IODelay(10000);
++			bootload = mmioRead(0xA000 + 0x4e8d);
++			rlcStat = mmioRead(0xA000 + 0x4c04);
++			cpStat = mmioRead(0x1260 + 0x0f40);
++		}
++		if ((bootload & 0x80000000u) != 0 && bootload != 0xFFFFFFFFu) {
++			LOG("gc_check_ucode_loaded: BOOTLOAD_COMPLETE=1 (bootload=%x rlc_stat=%x cp_stat=%x) -> returning 0",
++			    bootload, rlcStat, cpStat);
++			return 0;
++		}
++		LOG("gc_check_ucode_loaded: diag +400ms: BOOTLOAD=%x RLC_STAT=%x GPM=%x SRM=%x SCHED=%x GRBM2=%x CPC=%x CPF=%x MEC_CNTL=%x ME_CNTL=%x MEC1_IP=%x",
++		    bootload, rlcStat, mmioRead(0xA000 + 0x4c05), mmioRead(0xA000 + 0x4c06), mmioRead(0xA000 + 0x4ca1),
++		    mmioRead(0x1260 + 0x0da2), mmioRead(0x1260 + 0x0e24), mmioRead(0x1260 + 0x0e27),
++		    mmioRead(0x1260 + 0x0f55), mmioRead(0x1260 + 0x0f56), mmioRead(0x1260 + 0x0f48));
++		LOG("gc_check_ucode_loaded: gcvm: FB=%x-%x off=%x ctx0=%x fault=%x addr=%x_%08x; psp 64=%08x 81=%08x",
++		    mmioRead(0x1260 + 0x16fc), mmioRead(0x1260 + 0x16fd), mmioRead(0x1260 + 0x16e7),
++		    mmioRead(0x1260 + 0x15fc), mmioRead(0x1260 + 0x15c8), mmioRead(0x1260 + 0x15ca), mmioRead(0x1260 + 0x15c9),
++		    mmioRead(0x16000 + 0x80), mmioRead(0x16000 + 0x91));
+ 	}
+ 	return r;
+ }
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,214 @@
+From 37d9f3619d1a73942c7ed43b2fe7a463148548aa Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 17:51:41 -0800
+Subject: [PATCH 16/48] fix: desliga o aceite forcado do RLC (0015) e mede o
+ estagio 3 sem mudar comportamento
+
+Hipotese: o autoload do RLC nao conclui porque o processador de comandos ja
+esta ocupado antes do primeiro firmware (GRBM a0003028 em 40,602 s), e o
+primeiro desvio e a espera de 50 ms que estoura em 40,492 s, na subida da GVM.
+
+O que muda:
+- o aceite de RLC_STAT 0x25 (patch 0015) passa a exigir -rmbacceptrlc. Linux
+  v6.12 mantem autoload_supported = true para MP0 13.0.8 e exige CP_STAT == 0
+  e BOOTLOAD_COMPLETE; os boots mostram gc+0x329 = 0. O aceite so escondia o
+  erro 0xc0100206.
+- medicao, somente leitura, so no estagio 3: gancho em
+  AmdTtlServices::cosWaitForFunc (nome da funcao que espera, como deslocamento
+  da base do HWLibs), ganchos em _gc_cos_write_amdlog e _gvm_cos_write_amdlog
+  (indice do evento), e amostras de CP/RLC/memoria do GC antes e depois de
+  get_uma, psp_hw_init e ttl_hw_init.
+- linha com patch e data de compilacao no inicio do estagio 3.
+
+Confirma: "s3 wait: callback +X timeout 50 ms" nomeia a espera de 40,49 s e
+uma amostra mostra em que marco CP_STAT deixa de ser 0.
+Refuta: CP_STAT = 0 ate depois do AUTOLOAD_RLC.
+Para: panico, perda de SSH, RESTORE MISMATCH ou "failed to route".
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSo88Xro5AsvDqwXSnr
+---
+ src/RembrandtGfx/firmware.cpp   | 13 +++--
+ src/RembrandtGfx/kern_start.cpp | 93 ++++++++++++++++++++++++++++++---
+ 2 files changed, 95 insertions(+), 11 deletions(-)
+
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index c345905..690be8e 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -237,15 +237,20 @@ uint64_t wrapPspCmdKmSubmit(uint64_t psp, uint64_t inBuf, uint64_t outResp, uint
+ 	uint32_t cmd = inBuf ? *reinterpret_cast<const uint32_t *>(inBuf) : 0;
+ 	uint32_t fwType = (inBuf && cmd == 6) ? *reinterpret_cast<const uint32_t *>(inBuf + 0x10) : 0;
+ 	auto r = reinterpret_cast<Fn6>(orgPspCmdKmSubmit)(psp, inBuf, outResp, d, e, f);
++	// The submit's return is 0 even when the TOS refuses the command; the TOS answer is the first
++	// dword of the response (status, then session id at +4: _psp_asd_load reads the id from there).
++	uint32_t tos = outResp ? *reinterpret_cast<const uint32_t *>(outResp) : 0xFFFFFFFF;
+ 	if (rmbStage() == 3 || rmbVerbose() || (r & 0xFFFFFFFF)) {
+ 		if (cmd == 0xd) {
+-			LOG("psp-km: AUTOLOAD_RLC (0xd) ret=%llx; RLC_CNTL=%x RLC_STAT=%x BOOTLOAD=%x CP_STAT=%x GRBM=%x",
+-			    r & 0xFFFFFFFF, mmioRead(0xA000 + 0x4c00), mmioRead(0xA000 + 0x4c04), mmioRead(0xA000 + 0x4e8d),
++			LOG("psp-km: AUTOLOAD_RLC (0xd) ret=%llx tos=%x; RLC_CNTL=%x RLC_STAT=%x BOOTLOAD=%x CP_STAT=%x GRBM=%x",
++			    r & 0xFFFFFFFF, tos, mmioRead(0xA000 + 0x4c00), mmioRead(0xA000 + 0x4c04), mmioRead(0xA000 + 0x4e8d),
+ 			    mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4));
+ 		} else if (cmd == 6) {
+-			LOG("psp-km: LOAD_IP_FW type=%u ret=%llx", fwType, r & 0xFFFFFFFF);
++			LOG("psp-km: LOAD_IP_FW type=%u ret=%llx tos=%x; CP_STAT=%x GRBM=%x", fwType, r & 0xFFFFFFFF, tos,
++			    mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4));
+ 		} else {
+-			LOG("psp-km: cmd=%#x ret=%llx", cmd, r & 0xFFFFFFFF);
++			LOG("psp-km: cmd=%#x ret=%llx tos=%x; CP_STAT=%x GRBM=%x", cmd, r & 0xFFFFFFFF, tos,
++			    mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4));
+ 		}
+ 	}
+ 	return r;
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 4ae73ed..6b846a4 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -748,14 +748,69 @@ static uint64_t wrap_PEM_ExcuteEventChain(uint64_t ctx, uint64_t chain, uint64_t
+ // register need the carve-out's system physical address: VRAM offset + (GCMC_VM_FB_OFFSET << 24),
+ // as Linux's amdgpu_gmc_vram_mc2pa does. HWLibs' vm_10_1 does this only when the device caps mark
+ // the ASIC as UMA (vm ctx +0xc, bits 0x18), and the Navi 23 capability row we use says dGPU.
++// Stage 3 measurement (patch 0016), read-only: one line with the command processor, RLC and GC
++// memory state at a named point. Names and offsets from Linux v6.12 gc_10_3_0_offset.h.
++static void s3Sample(const char *when) {
++	if (rmbStage() != 3 || !mmioAvailable())
++		return;
++	constexpr uint32_t G0 = 0x1260, G1 = 0xA000;
++	LOG("s3 %s: GRBM %x STATUS2 %x CP_STAT %x CPC %x CPF %x RLC_CNTL %x RLC_STAT %x BOOTLOAD %x", when,
++	    mmioRead(G0 + 0x0da4), mmioRead(G0 + 0x0da2), mmioRead(G0 + 0x0f40), mmioRead(G0 + 0x0e24),
++	    mmioRead(G0 + 0x0e27), mmioRead(G1 + 0x4c00), mmioRead(G1 + 0x4c04), mmioRead(G1 + 0x4e8d));
++	LOG("s3 %s: FB %x-%x off %x SYSAP %x-%x ctx0 cntl %x pt %x_%08x start %x_%08x end %x_%08x fault %x addr %x_%08x", when,
++	    mmioRead(G0 + 0x16fc), mmioRead(G0 + 0x16fd), mmioRead(G0 + 0x16e7), mmioRead(G0 + 0x1701),
++	    mmioRead(G0 + 0x1702), mmioRead(G0 + 0x15fc), mmioRead(G0 + 0x1668), mmioRead(G0 + 0x1667),
++	    mmioRead(G0 + 0x1688), mmioRead(G0 + 0x1687), mmioRead(G0 + 0x16a8), mmioRead(G0 + 0x16a7),
++	    mmioRead(G0 + 0x15c8), mmioRead(G0 + 0x15ca), mmioRead(G0 + 0x15c9));
++}
++
+ static mach_vm_address_t org_get_uma_physical_fb_offset;
+ static uint64_t wrap_get_uma_physical_fb_offset(uint64_t vm, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	s3Sample("before get_uma");
++	if (rmbStage() == 3)
++		LOG("s3 vm flags before get_uma: +0xc=%x +0x210=%llx", *reinterpret_cast<uint8_t *>(vm + 0xc),
++		    *reinterpret_cast<uint64_t *>(vm + 0x210));
+ 	*reinterpret_cast<uint8_t *>(vm + 0xc) |= 0x8;
+ 	auto r = reinterpret_cast<Fn6>(org_get_uma_physical_fb_offset)(vm, b, c, d, e, f);
+ 	LOG("vm: UMA physical FB offset %llx", *reinterpret_cast<uint64_t *>(vm + 0x210));
++	s3Sample("after get_uma");
++	return r;
++}
++
++// Stage 3 measurement (patch 0016): every HWLibs wait goes through AmdTtlServices::cosWaitForFunc
++// (cos_wait_for_input: +0 callback, +8 context, +0x10 timeout in ms). Apple's own timeout message
++// prints the callback as <ptr>; print it as an offset from the HWLibs load address instead, so the
++// function that waits has a name. Only waits of 20 ms or more are logged.
++static mach_vm_address_t org_cosWaitForFunc;
++static uint64_t wrap_cosWaitForFunc(uint64_t self, uint64_t in, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	uint64_t cb = in ? *reinterpret_cast<const uint64_t *>(in) : 0;
++	uint32_t tmo = in ? *reinterpret_cast<const uint32_t *>(in + 0x10) : 0;
++	// The caller is the per-IP wrapper (_gvm_cos_wait_for, _psp_cos_wait_for, ...): it says which IP waits.
++	uint64_t caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
++	uint64_t t0 = mach_absolute_time(), ns;
++	auto r = reinterpret_cast<Fn6>(org_cosWaitForFunc)(self, in, c, d, e, f);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	if (ns >= 20000000) {
++		LOG("s3 wait: callback +%llx caller +%llx timeout %u ms took %llu ms ret %llx", cb ? cb - gHWLibsBase : 0,
++		    caller - gHWLibsBase, tmo, ns / 1000000, r & 0xFFFFFFFF);
++		s3Sample("after long wait");
++	}
+ 	return r;
+ }
+ 
++// Stage 3 measurement (patch 0016): the GC and GVM step/event index handed to the Apple logger
++// (index into _gc_log_event_map / _gvm_log_event_map). Index 7 of the GC map is the normal
++// "firmware list built" mark (0xc00c0401).
++static mach_vm_address_t org_gc_cos_write_amdlog, org_gvm_cos_write_amdlog;
++static uint64_t wrap_gc_cos_write_amdlog(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	LOG("s3 gc amdlog: index %#llx", b & 0xFFFFFFFF);
++	return reinterpret_cast<Fn6>(org_gc_cos_write_amdlog)(a, b, c, d, e, f);
++}
++static uint64_t wrap_gvm_cos_write_amdlog(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	LOG("s3 gvm amdlog: index %#llx", b & 0xFFFFFFFF);
++	return reinterpret_cast<Fn6>(org_gvm_cos_write_amdlog)(a, b, c, d, e, f);
++}
++
+ // Clamps a power state's clocks to the PowerPlay table's limits and divides by them; with no
+ // pptable on Rembrandt they are all zero (divide error). PMFW owns DPM, so leave states as-is.
+ static uint64_t wrap_ApplyClocksAdjustRules(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+@@ -780,12 +835,14 @@ static uint64_t wrap_gc_check_ucode_loaded_10_1(uint64_t gc, uint64_t b, uint64_
+ 	uint32_t grbm = mmioRead(0x1260 + 0x0da4);
+ 	LOG("gc_check_ucode_loaded: exit r=%llx; RLC_CNTL=%x RLC_STAT=%x BOOTLOAD=%x CP_STAT=%x GRBM=%x",
+ 	    r & 0xFFFFFFFF, rlcCntl, rlcStat, bootload, cpStat, grbm);
+-	// Mendocino (APU, PSP 13.0.8): Linux never uses RLC backdoor autoload here (psp->autoload_supported
+-	// is false for MP0 13.0.x APUs); the PSP loads and starts the RLC itself and BOOTLOAD_STATUS stays 0.
+-	// Apple's own APU variant of _gc_fw_autoload_is_completed (gc+0x329 set) expects RLC_STAT == 0x25,
+-	// which is exactly the running-RLC state seen here. Accept it (-rmbstrictbootload: don't).
++	// Forced accept of a running RLC (patch 0015). OFF by default since patch 0016: it hid the real
++	// failure. Linux v6.12 keeps psp->autoload_supported = true for MP0 13.0.8 (amdgpu_psp.c:167,
++	// 218-225) and gfx_v10_0_wait_for_rlc_autoload_complete needs CP_STAT == 0 and BOOTLOAD_COMPLETE
++	// (bit 31). RLC_STAT 0x25 is RLC_BUSY | GPM_BUSY | THREAD_0_BUSY, not "loaded", and the boots show
++	// gc+0x329 = 0. With the accept on, the next step (enter_rlc_safe_mode) times out instead
++	// (event 0xc0100211). -rmbacceptrlc turns it back on for comparison only.
+ 	if ((r & 0xFFFFFFFF) != 0 && gcHwVersion() == 0xa0307 && (rlcCntl & 1) && rlcStat == 0x25 &&
+-	    !checkKernelArgument("-rmbstrictbootload")) {
++	    checkKernelArgument("-rmbacceptrlc")) {
+ 		LOG("gc_check_ucode_loaded: Mendocino PSP front-door load, RLC running (RLC_CNTL=%x RLC_STAT=%x) -> returning 0",
+ 		    rlcCntl, rlcStat);
+ 		return 0;
+@@ -889,10 +946,14 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
++	LOG("stage 3: kext patch 0016, built " __DATE__ " " __TIME__ "; forced RLC accept %s",
++	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off");
+ 	smuStage3BeforeHwInit();
++	s3Sample("before ttl_hw_init");
+ 	LOG(">> ttl_hw_init(%llx, %llx)", a, b);
+ 	auto r = reinterpret_cast<Fn6>(org_ttl_hw_init_s3)(a, b, c, d, e, f);
+-	LOG("<< ttl_hw_init = %llx", r);
++	LOG("<< ttl_hw_init = %llx (bool: %u)", r, static_cast<unsigned>(r & 0xFF));
++	s3Sample("after ttl_hw_init");
+ 	return r;
+ }
+ 
+@@ -903,9 +964,11 @@ static uint64_t stage3_psp_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 		LOG("stage 3: psp_hw_init BLOCKED (the preflight has not passed), returning 1 without running Apple's code");
+ 		return 1;
+ 	}
++	s3Sample("before psp_hw_init");
+ 	LOG(">> psp_hw_init(%llx, %llx)", a, b);
+ 	auto r = reinterpret_cast<Fn6>(org_psp_hw_init_s3)(a, b, c, d, e, f);
+ 	LOG("<< psp_hw_init = %llx", r);
++	s3Sample("after psp_hw_init");
+ 	if (!checkKernelArgument("-rmbpsponly"))
+ 		return r;
+ 	gStage3Armed = false;
+@@ -993,8 +1056,24 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		LOG("stage 2: ttl_hw_init and psp_hw_init blocked, firmware and golden hooks not installed");
+ 	else
+ 		firmwareRoute(patcher, index, address, size);
+-	if (s3)
++	if (s3) {
++		// Measurement only (patch 0016); prologues checked position-independent in the 15.8.1 KC.
++		KernelPatcher::RouteRequest diag[] {
++			{"__ZN14AmdTtlServices14cosWaitForFuncEPvP18cos_wait_for_input", wrap_cosWaitForFunc, org_cosWaitForFunc},
++			{"_gc_cos_write_amdlog", wrap_gc_cos_write_amdlog, org_gc_cos_write_amdlog},
++			{"_gvm_cos_write_amdlog", wrap_gvm_cos_write_amdlog, org_gvm_cos_write_amdlog},
++		};
++		unsigned routed = 0;
++		for (auto &r : diag) {
++			if (patcher.routeMultiple(index, &r, 1, address, size))
++				routed++;
++			else
++				LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
++			patcher.clearError();
++		}
++		LOG("stage 3: %u of 3 measurement hooks installed (wait, gc amdlog, gvm amdlog)", routed);
+ 		LOG("stage 3: ttl_hw_init runs only if the preflight passes; wake POST hooks not installed");
++	}
+ 	LOG("HWLibs hooks installed");
+ }
+ 
+-- 
+2.39.5 (Apple Git-154)
+

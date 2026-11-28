@@ -1,0 +1,158 @@
+From 84c132d53fb435a6ace3e17878524628adcd38cf Mon Sep 17 00:00:00 2001
+From: fzmac <fzmac@localhost>
+Date: Thu, 26 Nov 2026 22:32:55 -0300
+Subject: [PATCH 45/48] -rmbagdc responde o getLinkConfig (AGDC 0x921) do fb0
+ com a temporizacao do OTG0, so leitura (0039)
+
+Co-authored-by: opus-fable
+---
+ src/RembrandtGfx/display.cpp    | 98 +++++++++++++++++++++++++++++++++
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ 2 files changed, 99 insertions(+), 1 deletion(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 859135c..511ed3e 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3354,6 +3354,9 @@ struct Mode {
+ 	bool ok;
+ 	uint32_t w, h, rowBytes, depth, hz, htot, vtot;
+ 	uint64_t consolePhys, hubpMc, fbBaseMc;
++	// Patch 0039: OTG0 H/V_BLANK_START_END, H/V_SYNC_A, H/V_SYNC_A_CNTL, raw (dcn_3_1_6_offset.h
++	// 0x1b2b, 0x1b2c, 0x1b2d, 0x1b36, 0x1b37, 0x1b38).
++	uint32_t hBlank, hSync, hSyncCntl, vBlank, vSync, vSyncCntl;
+ };
+ Mode gMode;
+ bool gOn, gRouted;
+@@ -3400,6 +3403,14 @@ void sample(bool measureHz) {
+ 		m.hubpMc = (static_cast<uint64_t>(mmioRead(D + 0x60b) & 0xffff) << 32) | mmioRead(D + 0x60a);
+ 		m.fbBaseMc = static_cast<uint64_t>(mmioRead(G0 + 0x16fc) & 0xFFFFFF) << 24;
+ 		m.htot = (mmioRead(D + 0x1b2a) & 0x7fff) + 1, m.vtot = (mmioRead(D + 0x1b2f) & 0x7fff) + 1;
++		m.hBlank = mmioRead(D + 0x1b2b), m.hSync = mmioRead(D + 0x1b2c), m.hSyncCntl = mmioRead(D + 0x1b2d);
++		m.vBlank = mmioRead(D + 0x1b36), m.vSync = mmioRead(D + 0x1b37), m.vSyncCntl = mmioRead(D + 0x1b38);
++		LOG("gopfb: OTG0 timing raw: H_BLANK %x H_SYNC_A %x CNTL %x V_BLANK %x V_SYNC_A %x CNTL %x", m.hBlank, m.hSync,
++		    m.hSyncCntl, m.vBlank, m.vSync, m.vSyncCntl);
++		// HUBP0 DCSURF_SURFACE_CONFIG / ADDR_CONFIG / TILING_CONFIG (0x5e5/0x5e6/0x5e7): with a flip a
++		// scrambled picture and a right address means the swizzle differs, not the address (Radeonized #8).
++		LOG("gopfb: HUBP0 SURFACE_CONFIG %x ADDR_CONFIG %x TILING_CONFIG %x", mmioRead(D + 0x5e5), mmioRead(D + 0x5e6),
++		    mmioRead(D + 0x5e7));
+ 		LOG("gopfb: console %s phys %llx %ux%u rowBytes %u depth %u; HUBP0 viewport %ux%u pitch %u px addr %llx; FB base %llx; OTG0 total %ux%u",
+ 		    pe ? "ok" : "MISSING", m.consolePhys, m.w, m.h, m.rowBytes, m.depth, vp & 0x3fff, (vp >> 16) & 0x3fff, pitch + 1,
+ 		    m.hubpMc, m.fbBaseMc, m.htot, m.vtot);
+@@ -3912,6 +3923,86 @@ IOReturn agdcExtCap(void *agdc, uint8_t *req, size_t size) {
+ 	return kIOReturnSuccess;
+ }
+ 
++// Patch 0039 (-rmbgopfb with -rmbagdc): IOPresentment takes the display's timing, and from it the
++// end point size CoreDisplay checks ("Invalid end point size"), from AGDC 0x921 =
++// AmdAgdcServices::getLinkConfig (c009184). Apple's copies the DAL display path's timing
++// (path+0x1c.. -> out+0x10..); with no link (+0x412) it returns SUCCESS with the timing zeroed,
++// with no path e00002c0: either way width/height 0 and no frame is ever submitted. Answer fb 0
++// with the timing the firmware left in OTG0 (read only), as an IODetailedTimingInformationV2 at
++// out+0x04, laid out as Radeonized does on the 680M (MIT, src/common/rb_agdc.h rb_agdc_link_config
++// and src/common/rb_otg.h rb_otg_to_v2): link id 0xFFFFFFFF, flags 0x08|0x02 (no link; bit 0 clear,
++// so 0x925/0x988 are not asked), stream +0xa4 = 0, state +0xac = 0x80000000.
++// Totals follow Linux's optc programming (register = total - 1), as gMode.htot/vtot already do.
++uint8_t gV2[0xa0];
++int gV2Err = -1;  // 0 ok; >0 which check failed (logged)
++int buildV2(const Mode &m) {
++	auto lo = [](uint32_t v) { uint32_t a = v & 0x7fff, b = (v >> 16) & 0x7fff; return a < b ? a : b; };  // 15-bit fields (dcn_3_1_6_sh_mask.h)
++	auto hi = [](uint32_t v) { uint32_t a = v & 0x7fff, b = (v >> 16) & 0x7fff; return a < b ? b : a; };
++	uint32_t ht = m.htot, vt = m.vtot;
++	uint32_t hbLo = lo(m.hBlank), hbHi = hi(m.hBlank), vbLo = lo(m.vBlank), vbHi = hi(m.vBlank);
++	uint32_t hsLo = lo(m.hSync), hsW = hi(m.hSync) - hsLo, vsLo = lo(m.vSync), vsW = hi(m.vSync) - vsLo;
++	uint32_t ha = hbHi - hbLo, va = vbHi - vbLo;
++	if (!ha || !va)
++		return 1;
++	if (ha != m.w || va != m.h)
++		return 2;  // OTG0 active area is not the inherited mode
++	if (ht <= ha || vt <= va || hbHi > ht || vbHi > vt)
++		return 3;
++	uint32_t hb = ht - ha, vb = vt - va, hf = ht - hbHi, vf = vt - vbHi;
++	if (hsLo != 0 || !hsW || hsW > hbLo || hf + hsW > hb)
++		return 4;
++	if (vsLo != 0 || !vsW || vsW > vbLo || vf + vsW > vb)
++		return 5;
++	uint64_t clock = static_cast<uint64_t>(ht) * vt * m.hz;
++	if (!clock)
++		return 6;
++	uint8_t v2[sizeof(gV2)] {};  // built locally, published to gV2 only when complete
++	auto p32 = [&v2](uint32_t o, uint32_t v) { *reinterpret_cast<uint32_t *>(v2 + o) = v; };
++	auto p64 = [&v2](uint32_t o, uint64_t v) { *reinterpret_cast<uint64_t *>(v2 + o) = v; };
++	p64(0x28, clock), p64(0x30, clock), p64(0x38, clock);
++	p32(0x40, ha), p32(0x44, hb), p32(0x48, hf), p32(0x4c, hsW);
++	p32(0x50, va), p32(0x54, vb), p32(0x58, vf), p32(0x5c, vsW);
++	if (!(m.hSyncCntl & 1))
++		p32(0x70, 1);  // kIOSyncPositivePolarity; OTG_*_SYNC_A_POL 1 = negative
++	if (!(m.vSyncCntl & 1))
++		p32(0x78, 1);
++	memcpy(gV2, v2, sizeof(gV2));
++	LOG("gopfb: timing for AGDC 0x921: %ux%u active, blank %u/%u, front %u/%u, sync %u/%u (%s/%s), total %ux%u, %u Hz, clock %llu Hz",
++	    ha, va, hb, vb, hf, vf, hsW, vsW, (m.hSyncCntl & 1) ? "-" : "+", (m.vSyncCntl & 1) ? "-" : "+", ht, vt, m.hz, clock);
++	return 0;
++}
++
++mach_vm_address_t gfbOrgAgdcLinkCfg;
++IOReturn agdcLinkCfg(void *agdc, uint8_t *cfg, size_t size) {
++	static uint32_t calls;
++	uint32_t c = ++calls;
++	if (gV2Err < 0 && gMode.ok) {
++		int e = buildV2(gMode);  // gV2 is complete before gV2Err says so
++		OSSynchronizeIO();
++		gV2Err = e;
++		if (gV2Err)
++			LOG("gopfb: timing for AGDC 0x921 refused (check %d): Apple's getLinkConfig answers", gV2Err);
++	}
++	if (gV2Err != 0 || !cfg || size != 0xb0 || *reinterpret_cast<uint32_t *>(cfg) != 0) {
++		auto r = reinterpret_cast<IOReturn (*)(void *, uint8_t *, size_t)>(gfbOrgAgdcLinkCfg)(agdc, cfg, size);
++		if (c <= 20)
++			LOG("gopfb: agdc 0x921 fb %u size %lx -> Apple's %x (timing h %u)", cfg && size >= 4 ? *reinterpret_cast<uint32_t *>(cfg) : 0xff, size, r,
++			    cfg && size >= 0x48 ? *reinterpret_cast<uint32_t *>(cfg + 4 + 0x40) : 0);
++		return r;
++	}
++	memset(cfg, 0, 0xb0);
++	memcpy(cfg + 4, gV2, sizeof(gV2));
++	*reinterpret_cast<uint32_t *>(cfg + 0x00) = 0;
++	*reinterpret_cast<uint32_t *>(cfg + 0x04) = 0xFFFFFFFF;
++	*reinterpret_cast<uint64_t *>(cfg + 0x08) = 0x0a;
++	*reinterpret_cast<uint32_t *>(cfg + 0xa4) = 0;
++	*reinterpret_cast<uint32_t *>(cfg + 0xa8) = 0;
++	*reinterpret_cast<uint32_t *>(cfg + 0xac) = 0x80000000;
++	if (c <= 20)
++		LOG("gopfb: agdc 0x921 fb 0 -> timing answered %ux%u", *reinterpret_cast<uint32_t *>(gV2 + 0x40), *reinterpret_cast<uint32_t *>(gV2 + 0x50));
++	return kIOReturnSuccess;
++}
++
+ }  // namespace gopfb
+ 
+ bool displayGopFbOn() { return gopfb::gOn; }
+@@ -3973,6 +4064,13 @@ void displayRouteGopFb(KernelPatcher &patcher, size_t index, mach_vm_address_t a
+ 		else
+ 			LOG("gopfb: failed to route getFbExtendedCapability (err %d)", patcher.getError());
+ 		patcher.clearError();
++		KernelPatcher::RouteRequest linkReq {"__ZNK30AMDRadeonX6000_AmdAgdcServices13getLinkConfigEP16AGDCLinkConfig_tm", agdcLinkCfg,
++			gfbOrgAgdcLinkCfg};
++		if (patcher.routeMultiple(index, &linkReq, 1, address, size))
++			LOG("gopfb: AGDC getLinkConfig routed (fb 0 timing answered from OTG0, 0039)");
++		else
++			LOG("gopfb: failed to route getLinkConfig (err %d)", patcher.getError());
++		patcher.clearError();
+ 	}
+ 	gFlipOn = gGopFlipWrites = gRouted && checkKernelArgument("-rmbgopflip");
+ 	LOG("gopfb: HUBP0 flip on 'amtr' %s", gFlipOn ? "ON (only 0x3aca/0x3acb)" : "off");
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 9f7002b..0d8638d 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1317,7 +1317,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0038c, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0039, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+-- 
+2.39.5 (Apple Git-154)
+

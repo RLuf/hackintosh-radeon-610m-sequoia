@@ -1,0 +1,88 @@
+From 82cbe30564a7011a3721d3a5f57aeb14592dd57c Mon Sep 17 00:00:00 2001
+From: Roger Luft <rluft@pop.local>
+Date: Thu, 26 Nov 2026 01:46:23 -0300
+Subject: [PATCH 33/48] -rmbibdump amplia o dump do IB nos relatorios de GPU;
+ tira a leitura de 0x16fa (0029)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/kern_start.cpp | 10 +++++-----
+ src/RembrandtGfx/probe.cpp      | 19 +++++++++++++++++++
+ 2 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index b5da528..d2b12fa 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1075,8 +1075,8 @@ static void s3Sample(const char *when) {
+ 	    mmioRead(G0 + 0x1688), mmioRead(G0 + 0x1687), mmioRead(G0 + 0x16a8), mmioRead(G0 + 0x16a7),
+ 	    mmioRead(G0 + 0x15c8), mmioRead(G0 + 0x15ca), mmioRead(G0 + 0x15c9));
+ 	// Address translation (UTCL2 / GCVM L2) and shader-array harvest state (patch 0021).
+-	LOG("s3 %s: UTCL2_HARVEST_BYPASS yc(16f8) %x gen(16fa) %x CC_SA_DIS %x USER_SA_DIS %x L2_CNTL %x %x %x %x L2_STATUS %x L1_TLB %x FAULT_CNTL %x GB_ADDR %x CC_SH_ARRAY %x USER_SH_ARRAY %x RLC_SAFE %x",
+-	    when, mmioRead(G0 + 0x16f8), mmioRead(G0 + 0x16fa), mmioRead(G0 + 0x0fe9), mmioRead(G0 + 0x0fea),
++	LOG("s3 %s: UTCL2_HARVEST_BYPASS yc(16f8) %x CC_SA_DIS %x USER_SA_DIS %x L2_CNTL %x %x %x %x L2_STATUS %x L1_TLB %x FAULT_CNTL %x GB_ADDR %x CC_SH_ARRAY %x USER_SH_ARRAY %x RLC_SAFE %x",
++	    when, mmioRead(G0 + 0x16f8), mmioRead(G0 + 0x0fe9), mmioRead(G0 + 0x0fea),
+ 	    mmioRead(G0 + 0x15bc), mmioRead(G0 + 0x15bd), mmioRead(G0 + 0x15be), mmioRead(G0 + 0x15d4),
+ 	    mmioRead(G0 + 0x15bf), mmioRead(G0 + 0x1703), mmioRead(G0 + 0x15c4), mmioRead(G0 + 0x13de),
+ 	    mmioRead(G0 + 0x100f), mmioRead(G0 + 0x1010), mmioRead(G1 + 0x4ca0));
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0028e, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0029, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+@@ -1453,7 +1453,7 @@ static uint64_t wrap_gc_10_3_1_initialize_utcl2_bypass_groups(uint64_t a, uint64
+ 	constexpr uint32_t G0 = 0x1260;
+ 	bool can = mmioAvailable();
+ 	uint32_t efuse = can ? mmioRead(G0 + 0x0fe9) : 0, user = can ? mmioRead(G0 + 0x0fea) : 0;
+-	uint32_t yc = can ? mmioRead(G0 + 0x16f8) : 0, gen = can ? mmioRead(G0 + 0x16fa) : 0;
++	uint32_t yc = can ? mmioRead(G0 + 0x16f8) : 0, gen = 0;  // 0x16fa is not readable on GC 10.3.7 (GRBM_READ_ERROR), patch 0029
+ 	uint32_t dis = ((efuse | user) >> 8) & 3, want = (dis & 1 ? 3u : 0u) | (dis & 2 ? 0xcu : 0u);
+ 	if (gcHwVersion() == 0xa0307 && !checkKernelArgument("-rmbutcl2harvest")) {
+ 		// HWLibs writes the register even when the value is 0, so the skipped write is a no-op only
+@@ -1466,7 +1466,7 @@ static uint64_t wrap_gc_10_3_1_initialize_utcl2_bypass_groups(uint64_t a, uint64
+ 	}
+ 	auto r = reinterpret_cast<Fn6>(org_gc_10_3_1_initialize_utcl2_bypass_groups)(a, b, c, d, e, f);
+ 	LOG("gc: utcl2 bypass groups programmed by HWLibs: CC_SA_DIS %x USER_SA_DIS %x (expected value %x); yc(16f8) %x -> %x, gen(16fa) %x -> %x",
+-	    efuse, user, want, yc, can ? mmioRead(G0 + 0x16f8) : 0, gen, can ? mmioRead(G0 + 0x16fa) : 0);
++	    efuse, user, want, yc, can ? mmioRead(G0 + 0x16f8) : 0, gen, 0u);
+ 	return r;
+ }
+ 
+diff --git a/src/RembrandtGfx/probe.cpp b/src/RembrandtGfx/probe.cpp
+index 7c25809..9de38a9 100644
+--- a/src/RembrandtGfx/probe.cpp
++++ b/src/RembrandtGfx/probe.cpp
+@@ -1015,6 +1015,25 @@ void probeRouteAccel(KernelPatcher &patcher, size_t index, mach_vm_address_t add
+ 	gGetHWChannelEngineRing = patcher.solveSymbol(index,
+ 		"__ZN26AMDRadeonX6000_AMDHardware12getHWChannelE20_eAMD_HW_ENGINE_TYPE18_eAMD_HW_RING_TYPE", address, size);
+ 	patcher.clearError();
++	if (checkKernelArgument("-rmbibdump")) {  // patch 0029: measurement only
++		// writePendingCommandInfoDiagnosisReport +0x305: leal 0x100(%r13),%r8d caps the IB dump of a
++		// .gpuRestart report at 0x100 dwords; the code clamps to the buffer size right after (+0x317).
++		auto fn = patcher.solveSymbol(index,
++		    "__ZN30AMDRadeonX6000_AMDAccelChannel38writePendingCommandInfoDiagnosisReportERPcRjP18AMD_COMMAND_BUFFERP11IOAccelTask",
++		    address, size);
++		patcher.clearError();
++		static const uint8_t want[] {0x45, 0x8d, 0x85, 0x00, 0x01, 0x00, 0x00};
++		auto p = fn ? reinterpret_cast<uint8_t *>(fn + 0x305) : nullptr;
++		if (!p || memcmp(p, want, sizeof(want))) {
++			LOG("ibdump: writePendingCommandInfoDiagnosisReport %s, not patched", fn ? "bytes differ" : "not found");
++		} else if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
++			LOG("ibdump: kernel writing failed");
++		} else {
++			p[4] = 0x04;  // 0x100 -> 0x400 dwords
++			MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
++			LOG("ibdump: gpuRestart reports now dump up to 0x400 IB dwords (was 0x100)");
++		}
++	}
+ 	KernelPatcher::RouteRequest reqs[] {
+ 		{"__ZN26AMDRadeonX6000_AMDHWMemory4initEP30AMDRadeonX6000_IAMDHWInterface", wrapHWMemInit, orgHWMemInit},
+ 		{"__ZN26AMDRadeonX6000_AMDHWMemory12initVRAMInfoEv", wrapInitVRAMInfo, orgInitVRAMInfo},
+-- 
+2.39.5 (Apple Git-154)
+

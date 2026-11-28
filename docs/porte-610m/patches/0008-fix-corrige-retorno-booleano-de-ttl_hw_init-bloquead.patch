@@ -1,0 +1,57 @@
+From 65ff9b9251b8fa11293f8ada2977ed879452cd33 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 04:05:07 -0800
+Subject: [PATCH 08/48] fix: corrige retorno booleano de ttl_hw_init bloqueado
+ nos estagios 2 e 3
+
+---
+ src/RembrandtGfx/kern_start.cpp | 26 ++++++++++++++------------
+ 1 file changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index d601022..986c221 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -734,16 +734,18 @@ static uint64_t wrap_gc_10_3_initialize_registers(uint64_t a, uint64_t b, uint64
+ 	return r;
+ }
+ 
+-// Stage 2 (rmbstage=2): the hardware-init entry points fail before any of Apple's code runs. In this
+-// family 0 is success (our own smu_sw_init / smu_hw_init replacements return 0, psp_tmr_init's caller
+-// treats nonzero as failure, firmware.cpp) and upstream saw ttl_initialize = 1 for a rejected device.
+-#define BLOCK_HOOK(name)                                                                       \
+-	static uint64_t block_##name(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {   \
+-		LOG("stage 2: " #name " BLOCKED, returning 1 without running Apple's code");           \
+-		return 1;                                                                              \
+-	}
+-BLOCK_HOOK(ttl_hw_init)
+-BLOCK_HOOK(psp_hw_init)
++// Stage 2 (rmbstage=2): the hardware-init entry points fail before any of Apple's code runs.
++// Watch the two return conventions: _ttl_hw_init returns bool to _ttl_initialize (0 = false =
++// failure, causing ttl_initialize to fail cleanly with 4; returning 1 would claim success!), while
++// _psp_hw_init returns a C SWIP status code (0 = OK, nonzero = failure).
++static uint64_t block_ttl_hw_init(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
++	LOG("stage 2: ttl_hw_init BLOCKED, returning 0 (false) without running Apple's code");
++	return 0;
++}
++static uint64_t block_psp_hw_init(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
++	LOG("stage 2: psp_hw_init BLOCKED, returning 1 (error) without running Apple's code");
++	return 1;
++}
+ 
+ // Hooks that only matter once hardware init runs; stage 2 does not install them. Stage 3 leaves out
+ // only the last two (the wake-time VBIOS POST: no sleep support at that stage).
+@@ -790,8 +792,8 @@ static bool stage3Preflight() {
+ static mach_vm_address_t org_ttl_hw_init_s3, org_psp_hw_init_s3;
+ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	if (!stage3Preflight()) {
+-		LOG("stage 3: ttl_hw_init BLOCKED by the preflight, returning 1 without running Apple's code");
+-		return 1;
++		LOG("stage 3: ttl_hw_init BLOCKED by the preflight, returning 0 (false) without running Apple's code");
++		return 0;
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-- 
+2.39.5 (Apple Git-154)
+

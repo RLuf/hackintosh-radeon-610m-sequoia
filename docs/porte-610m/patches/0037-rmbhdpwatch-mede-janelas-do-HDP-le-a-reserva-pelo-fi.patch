@@ -1,0 +1,323 @@
+From 69008ecec8af4a65df38196984bfb28e10d93b67 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 04:55:20 -0300
+Subject: [PATCH 37/48] -rmbhdpwatch: mede janelas do HDP, le a reserva pelo
+ fisico e despeja os shaders na trava (0033)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/kern_start.cpp |   2 +-
+ src/RembrandtGfx/mmio.cpp       |  55 ++++++++++++-
+ src/RembrandtGfx/probe.cpp      | 133 ++++++++++++++++++++++++++++++++
+ src/RembrandtGfx/rmb.hpp        |   6 ++
+ src/RembrandtGfx/vmwatch.cpp    |  33 ++++++++
+ 5 files changed, 227 insertions(+), 2 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index e1a3d66..88dbc89 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0032, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0033, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/mmio.cpp b/src/RembrandtGfx/mmio.cpp
+index d96536d..9308831 100644
+--- a/src/RembrandtGfx/mmio.cpp
++++ b/src/RembrandtGfx/mmio.cpp
+@@ -152,6 +152,56 @@ static volatile uint8_t *vramPtr(uint64_t off) {
+ 	return reinterpret_cast<volatile uint8_t *>(gVramPage->getVirtualAddress() + (off & 0xFFF));
+ }
+ 
++// Patch 0033 (-rmbhdpwatch): offsets past the BAR window read the carve-out at its physical address
++// (FB_OFFSET << 24, 0x3c0000000 here), one uncached page at a time, without MM_INDEX (barred under the
++// probe) and without the BAR/HDP. Read only. Linux on an APU reaches the whole carve-out this way.
++bool gCarveRead;
++static IOMemoryDescriptor *gCarveMd;
++static IOMemoryMap *gCarvePage;
++static uint64_t gCarvePageOff = ~0ULL;
++
++uint64_t carvePhysBase() {
++	return (uint64_t)(mmioRead(0x1260 + 0x16e7) & 0xFFFFFF) << 24;
++}
++
++// Caller holds vramLock.
++static bool carveRead64Locked(uint64_t off, uint64_t &v) {
++	uint64_t base = carvePhysBase();
++	if (!base || base == 0xFFFFFFull << 24 || off >= 0x80000000ULL)
++		return false;
++	uint64_t page = off & ~0xFFFULL;
++	if (page != gCarvePageOff) {
++		if (gCarvePage)
++			gCarvePage->release();
++		if (gCarveMd)
++			gCarveMd->release();
++		gCarvePage = nullptr;
++		gCarvePageOff = ~0ULL;
++		gCarveMd = IOMemoryDescriptor::withAddressRange(base + page, 0x1000, kIODirectionIn, nullptr);
++		if (!gCarveMd)
++			return false;
++		gCarvePage = gCarveMd->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 0x1000);
++		if (!gCarvePage)
++			return false;
++		gCarvePageOff = page;
++	}
++	v = *reinterpret_cast<volatile uint64_t *>(gCarvePage->getVirtualAddress() + (off & 0xFFF));
++	return true;
++}
++
++// Carve-out read by physical address at any offset (only with -rmbhdpwatch); ~0 if unavailable.
++uint64_t carveRead64(uint64_t off) {
++	auto l = gCarveRead ? vramLock() : nullptr;
++	if (!l)
++		return ~0ULL;
++	IOLockLock(l);
++	uint64_t v;
++	if (!carveRead64Locked(off, v))
++		v = ~0ULL;
++	IOLockUnlock(l);
++	return v;
++}
++
+ uint64_t vramRead64(uint64_t off) {
+ 	if (!findVram())
+ 		return ~0ULL;
+@@ -160,7 +210,10 @@ uint64_t vramRead64(uint64_t off) {
+ 		return ~0ULL;
+ 	IOLockLock(l);
+ 	uint64_t v;
+-	if (off + 8 > gVram->getLength())
++	if (off + 8 > gVram->getLength() && gCarveRead && rmbProbe()) {
++		if (!carveRead64Locked(off, v))
++			v = ~0ULL;
++	} else if (off + 8 > gVram->getLength())
+ 		v = vramReadIndirect32(off) | (uint64_t)vramReadIndirect32(off + 4) << 32;
+ 	else {
+ 		auto p = vramPtr(off);
+diff --git a/src/RembrandtGfx/probe.cpp b/src/RembrandtGfx/probe.cpp
+index 9f8dacd..beb1c06 100644
+--- a/src/RembrandtGfx/probe.cpp
++++ b/src/RembrandtGfx/probe.cpp
+@@ -84,8 +84,131 @@ uint64_t wrapSdmaReset(uint64_t self, uint64_t ring, uint64_t c, uint64_t d, uin
+ 	return r;
+ }
+ 
++// Patch 0033 (-rmbhdpwatch), measurement only. AMDGFX10HWMemory::programOrClearHDPRegisters(win,
++// bar, vramOff, size, clear) (be9a91e) points HDP window win (registers [mem+0x80] + 0x44..0x48 + 6*win,
++// undocumented in Linux hdp 5.0/5.2) so a block inside the 256 MB BAR reaches a carve-out offset above
++// it. After Apple's call: read the registers back, then (on a thread, 300 ms later, after the CPU wrote)
++// compare BAR[bar] with carve[vramOff] and carve[bar] by physical address. Window works: BAR = carve
++// at vramOff. Window ignored by the 610M's HDP: BAR = carve at bar (the CPU's data lands in the
++// reserved block, the resource stays stale). Nothing is written.
++static uint64_t orgProgramHDP, orgMemPrepare, orgMemComplete;
++// One slot per HDP window: what was programmed, to compare when the window is taken down.
++struct HdpWin { bool valid; uint32_t call, reg46; uint64_t bar, voff, size; const char *who; };
++static HdpWin gHdpWin[32];
++static uint32_t gHdpCalls, gHdpCompares, gHdpStraddles;
++
++static uint64_t hdpLocal(uint64_t hwmem, uint64_t a) {
++	uint64_t mc = q(hwmem, 0x50);
++	return a >= mc && a < mc + q(hwmem, 0x40) ? a - mc : a;
++}
++
++// First window: does the physical carve-out read agree with the BAR where both reach (offset 0x1000)?
++// If not, no verdict below is worth anything.
++static void hdpFirst(uint64_t self) {
++	uint64_t b = vramRead64(0x1000), c = carveRead64(0x1000), b2 = vramRead64(0x8000000), c2 = carveRead64(0x8000000);
++	LOG("hdp: first window; HDP base %x, windows %u; HDP flush remap mem %x reg %x; self-check BAR/carve at 1000: %016llx %016llx, "
++		"at 8000000: %016llx %016llx -> %s", *reinterpret_cast<uint32_t *>(self + 0x80), *reinterpret_cast<uint32_t *>(self + 0x2c),
++		mmioRead(0xD20 + 0x12d), mmioRead(0xD20 + 0x12e), b, c, b2, c2,
++		b == c && b2 == c2 && c != ~0ULL ? "physical path OK" : "PHYSICAL PATH DISAGREES, verdicts invalid");
++}
++
++static void hdpNote(uint64_t self, const char *who, uint32_t w, uint64_t bar, uint64_t voff, uint64_t size) {
++	uint32_t call = ++gHdpCalls, base = *reinterpret_cast<uint32_t *>(self + 0x80);
++	if (call == 1)
++		hdpFirst(self);
++	uint32_t regs[5];
++	for (uint32_t k = 0; k < 5; k++)
++		regs[k] = mmioRead(base + 0x44 + k + 6 * w);
++	if (call <= 48 || !(call & 63))
++		LOG("hdp: #%u %s win %u bar %llx vram %llx size %llx; regs 44..48 = %x %x %x %x %x", call, who, w, bar, voff, size,
++			regs[0], regs[1], regs[2], regs[3], regs[4]);
++	if (w < arrsize(gHdpWin))
++		gHdpWin[w] = {true, call, regs[2], hdpLocal(self, bar), hdpLocal(self, voff), size, who};
++}
++
++// Window w is being cleared. Before Apple's call (window still live, the CPU has written through it):
++// BAR[bar] and register 0x46. After it (Apple flushed the HDP, hw->0x1f0, then took the window down):
++// carve[voff] and carve[bar] by physical address. Window works: BAR_before = carve[voff] != carve[bar].
++// Window ignored by the 610M's HDP: BAR_before = carve[bar] != carve[voff] (the CPU's data sits in the
++// reserved block, the resource stays stale). Verdict only if 0x46 still held what was programmed.
++struct HdpPre { bool on; uint32_t w, now; HdpWin n; uint64_t b[2]; };
++static HdpPre hdpBefore(uint64_t self, uint32_t w) {
++	HdpPre p {};
++	if (w >= arrsize(gHdpWin) || !gHdpWin[w].valid)
++		return p;
++	p.n = gHdpWin[w];
++	gHdpWin[w].valid = false;
++	if (gHdpCompares >= 48)
++		return p;
++	gHdpCompares++;
++	p.on = true;
++	p.w = w;
++	p.now = mmioRead(*reinterpret_cast<uint32_t *>(self + 0x80) + 0x46 + 6 * w);
++	p.b[0] = vramRead64(p.n.bar);
++	p.b[1] = p.n.size > 0x1000 ? vramRead64(p.n.bar + 0x1000) : 0;
++	return p;
++}
++
++static void hdpAfter(const HdpPre &p) {
++	if (!p.on)
++		return;
++	for (uint32_t k = 0; k < 2; k++) {
++		uint64_t o = k ? 0x1000 : 0;
++		if (k && p.n.size <= 0x1000)
++			break;
++		uint64_t b = p.b[k], cv = carveRead64(p.n.voff + o), cb = carveRead64(p.n.bar + o);
++		LOG("hdp: #%u %s win %u +%llx: BAR[bar] before clear %016llx, after: carve[voff] %016llx carve[bar] %016llx -> %s", p.n.call,
++			p.n.who, p.w, o, b, cv, cb, p.now != p.n.reg46 ? "undecided (window changed)" : b == cv && b != cb ? "WINDOW WORKS" :
++			b == cb && b != cv ? "WINDOW IGNORED (BAR shows its own block)" : b == cv ? "same data, undecided" : "neither");
++	}
++}
++
++// Kernel-internal CPU access path (prepareForCPUAccess / completeForCPUAccess).
++uint64_t wrapProgramHDP(uint64_t self, uint64_t win, uint64_t bar, uint64_t voff, uint64_t size, uint64_t clear) {
++	uint32_t w = win & 0xFF;
++	HdpPre p {};
++	if (clear & 0xFF)
++		p = hdpBefore(self, w);
++	auto r = reinterpret_cast<Fn6>(orgProgramHDP)(self, win, bar, voff, size, clear);
++	if (clear & 0xFF)
++		hdpAfter(p);
++	else
++		hdpNote(self, "cpu-access", w, bar, voff, size);
++	return r;
++}
++
++// Resource path (AMDAccelResource: shaders, IBs): prepare (be9a6ac) programs the window itself and keeps
++// it in [res+0x1bd] (0xff = direct BAR access); it only checks the START against the visible 256 MB
++// (+0x5d..+0x6a), so a resource that starts below and ends above goes direct past the BAR's end.
++uint64_t wrapMemPrepare(uint64_t self, uint64_t res, uint64_t off, uint64_t size, uint64_t ap, uint64_t f) {
++	auto r = reinterpret_cast<Fn6>(orgMemPrepare)(self, res, off, size, ap, f);
++	if (!res || !(r & 0xFF))  // failed prepare (+0x52/+0x55) leaves 0x1bd and *ap untouched
++		return r;
++	uint32_t w = *reinterpret_cast<uint8_t *>(res + 0x1bd);
++	uint64_t vis = q(self, 0x48);
++	if (w == 0xff) {
++		if (off < vis && off + size > vis && gHdpStraddles++ < 10)
++			LOG("hdp: resource %llx off %llx size %llx crosses the visible %llx: direct BAR access past its end (#%u)", res, off, size,
++				vis, gHdpStraddles);
++	} else if (ap)
++		hdpNote(self, "resource", w, *reinterpret_cast<uint64_t *>(ap), off, size);
++	return r;
++}
++
++uint64_t wrapMemComplete(uint64_t self, uint64_t res, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	HdpPre p {};
++	if (res && *reinterpret_cast<uint8_t *>(res + 0x1bd) != 0xff)
++		p = hdpBefore(self, *reinterpret_cast<uint8_t *>(res + 0x1bd));
++	auto r = reinterpret_cast<Fn6>(orgMemComplete)(self, res, c, d, e, f);
++	hdpAfter(p);
++	return r;
++}
++
+ uint64_t wrapResetHardware(uint64_t self, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	LOG("hw-reset: resetHardware(%llx)", b);
++	static uint32_t dumps;
++	if (gCarveRead && dumps++ < 3)
++		shaderDump("hang");
+ 	auto r = reinterpret_cast<Fn6>(orgResetHardware)(self, b, c, d, e, f);
+ 	syncSdmaAddrConfig("after resetHardware");
+ 	return r;
+@@ -1063,6 +1186,16 @@ void probeRouteAccel(KernelPatcher &patcher, size_t index, mach_vm_address_t add
+ 		{"__ZN35AMDRadeonX6000_AMDAtomicBlitManager8doExpandEP15_UBM_EXPANDINFOPK11ABM_OPTIONS", wrapUbmOp<&orgDoExpand, 'E'>, orgDoExpand},
+ 	};
+ 	route(patcher, index, address, size, reqs, arrsize(reqs));
++	if (checkKernelArgument("-rmbhdpwatch")) {  // patch 0033: measurement only
++		gCarveRead = true;
++		KernelPatcher::RouteRequest hr[] {
++			{"__ZN31AMDRadeonX6000_AMDGFX10HWMemory26programOrClearHDPRegistersEhyyyb", wrapProgramHDP, orgProgramHDP},
++			{"__ZN31AMDRadeonX6000_AMDGFX10HWMemory7prepareEP31AMDRadeonX6000_AMDAccelResourceyyPy", wrapMemPrepare, orgMemPrepare},
++			{"__ZN31AMDRadeonX6000_AMDGFX10HWMemory8completeEP31AMDRadeonX6000_AMDAccelResource", wrapMemComplete, orgMemComplete},
++		};
++		route(patcher, index, address, size, hr, arrsize(hr));
++		LOG("hdpwatch: HDP window checks on, carve-out read by physical address past the BAR, shader dump at hangs");
++	}
+ 	if (checkKernelArgument("-rmbgopfb")) {  // patch 0028b: measurement only
+ 		KernelPatcher::RouteRequest gr[] {
+ 			{"__ZN27AMDRadeonX6000_AMDHWDisplay14getDisplayInfoEjbbPvP17_FRAMEBUFFER_INFO", wrapGetDisplayInfo, orgGetDisplayInfo},
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index c51aa9a..13ca802 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -162,6 +162,11 @@ void panicKeep(const char *fmt, ...) __printflike(1, 2);
+ void eoi0Note(uint32_t reg, uint32_t val);
+ // 64-bit read from CPU-visible VRAM (BAR0) at a VRAM offset; ~0 if unavailable.
+ uint64_t vramRead64(uint64_t off);
++// Patch 0033 (-rmbhdpwatch): carve-out physical base (FB_OFFSET << 24) and a read of it by physical
++// address; with gCarveRead, vramRead64 past the BAR uses it instead of MM_INDEX.
++extern bool gCarveRead;
++uint64_t carvePhysBase();
++uint64_t carveRead64(uint64_t off);
+ // 32-bit write to CPU-visible VRAM (BAR0 window only).
+ bool vramWrite32(uint64_t off, uint32_t value);
+ 
+@@ -182,6 +187,7 @@ void ptScanInit(KernelPatcher &patcher);
+ void ptScan(const char *why);
+ void ptScanVmid(uint32_t vmid, bool quietIfSame = false);
+ uint64_t ptVmidBase(uint32_t vmid);
++void shaderDump(const char *why);  // patch 0033: shader code at a hang, HDP flush remap
+ void mmhubDump(const char *why);  // 0 when the context is disabled
+ void gartCensus(const char *when);
+ // Save the GART at S3 entry; on wake put back PTEs that were valid then and are zero now.
+diff --git a/src/RembrandtGfx/vmwatch.cpp b/src/RembrandtGfx/vmwatch.cpp
+index 268b659..9fba2d4 100644
+--- a/src/RembrandtGfx/vmwatch.cpp
++++ b/src/RembrandtGfx/vmwatch.cpp
+@@ -596,3 +596,36 @@ void mmhubDump(const char *why) {
+ 	buf[n] = 0;
+ 	LOG("mmhub: %s: enabled contexts%s", why, n ? buf : " none");
+ }
++
++// Patch 0033 (-rmbhdpwatch), called at a GPU hang: the VS/PS shader addresses the chip holds
++// (SPI_SHADER_PGM_LO/HI_VS 0x19e8/9, _PS 0x19a8/9, gc_10_3_0_offset.h; GPU VA = LO << 8 | HI << 40),
++// plus the addresses seen in the 3D hang IBs, walked in every enabled VMID; 64 bytes of each shader.
++// Zeros (no s_endpgm 0xbf810000) mean the CPU's upload never reached the carve-out.
++// Also the NBIO HDP flush remap (REMAP_HDP_MEM/REG_FLUSH_CNTL 0xD20 + 0x12d/0x12e; Linux programs
++// the MMIO hole 0x7f000/0x7f004, nbio_v7_2.c:407-413).
++void shaderDump(const char *why) {
++	uint64_t vs = (uint64_t)gc(0x19e8) << 8 | (uint64_t)(gc(0x19e9) & 0xFF) << 40;
++	uint64_t ps = (uint64_t)gc(0x19a8) << 8 | (uint64_t)(gc(0x19a9) & 0xFF) << 40;
++	LOG("shader %s: PGM VS %llx PS %llx; HDP flush remap mem %x reg %x; carve phys %llx", why, vs, ps,
++		mmioRead(0xD20 + 0x12d), mmioRead(0xD20 + 0x12e), carvePhysBase());
++	const uint64_t vas[] {vs, ps, 0x400028b00ULL, 0x400028700ULL, 0x4001d0000ULL};
++	const char *names[] {"vs(reg)", "ps(reg)", "vs(ib)", "ps(ib)", "ib"};
++	for (uint32_t vmid = 1; vmid < 16; vmid++) {
++		if (!(gc(ctxCntl(vmid)) & 1))
++			continue;
++		for (uint32_t i = 0; i < arrsize(vas); i++) {
++			if (!vas[i] || (i >= 2 && (vas[i] == vs || vas[i] == ps)))
++				continue;
++			auto x = walk(vmid << 20, vas[i] >> 12, false);
++			if (!x.ok) {
++				LOG("shader %s: vmid %u %s va %llx not mapped", why, vmid, names[i], vas[i]);
++				continue;
++			}
++			LOG("shader %s: vmid %u %s va %llx -> %s %llx (pte %llx)", why, vmid, names[i], vas[i],
++				x.sys ? "system" : "carve off", x.addr + (vas[i] & 0xFFF), x.pte);
++			char tag[48];
++			snprintf(tag, sizeof(tag), "shader %s %s", why, names[i]);
++			dumpGpuVa(tag, vmid, vas[i], 16);
++		}
++	}
++}
+-- 
+2.39.5 (Apple Git-154)
+

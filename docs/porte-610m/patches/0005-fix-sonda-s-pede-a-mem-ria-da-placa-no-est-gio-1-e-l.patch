@@ -1,0 +1,85 @@
+From 5808392a68c2008fcecd25bfa6bd66c4007bd96d Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Sat, 21 Nov 2026 03:57:40 +0000
+Subject: [PATCH 05/48] =?UTF-8?q?fix:=20sonda=20s=C3=B3=20pede=20a=20mem?=
+ =?UTF-8?q?=C3=B3ria=20da=20placa=20no=20est=C3=A1gio=201=20e=20libera=20o?=
+ =?UTF-8?q?=20descritor=20pr=C3=B3prio?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Do estágio 2 em diante os drivers da Apple casam com a placa e o IOKit
+monta a lista de memória para eles; a sonda não se adianta a isso e usa
+o endereço do BAR 5 direto quando a lista ainda não existe.
+
+O descritor criado a partir do BAR 5 era local e nunca era liberado.
+Agora a leitura dos registradores fica em readTable() e o descritor
+próprio é liberado ao fim da sonda.
+---
+ src/RembrandtGfx/ipdisc.cpp | 29 ++++++++++++++++++++++-------
+ 1 file changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/src/RembrandtGfx/ipdisc.cpp b/src/RembrandtGfx/ipdisc.cpp
+index eec3d7a..cc37906 100644
+--- a/src/RembrandtGfx/ipdisc.cpp
++++ b/src/RembrandtGfx/ipdisc.cpp
+@@ -249,6 +249,7 @@ void physPeek(uint64_t pa) {
+ }
+ 
+ void probe(IOService *svc, bool retry);
++void readTable(IOMemoryDescriptor *regs, uint32_t bar5);
+ 
+ void retryThread(void *arg, wait_result_t) {
+ 	auto svc = static_cast<IOService *>(arg);
+@@ -275,11 +276,13 @@ void probe(IOService *svc, bool retry) {
+ 	// 82X5, M1 boot 2 (2026-11-20): no "device memory" line at all. IOPCIFamily builds the list in
+ 	// IOPCIDevice::getResources(), which IOKit calls when a driver is about to probe the nub, and no
+ 	// Apple driver matches 1002:1506 at stage 1. Ask for it here; the call returns at once when the
+-	// list already exists.
+-	if (!svc->getDeviceMemoryCount()) {
++	// list already exists. Stage 1 only: from stage 2 on Apple's own drivers match the nub (fake
++	// device-id) and IOKit builds the list for them, so this file must not get ahead of that.
++	if (!svc->getDeviceMemoryCount() && rmbStage() == 1) {
+ 		IOReturn r = svc->getResources();
+ 		LOG("probe: no device memory yet, getResources = %x, %u entries now", r, svc->getDeviceMemoryCount());
+-	}
++	} else if (!svc->getDeviceMemoryCount())
++		LOG("probe: no device memory yet, getResources not called at stage %u", rmbStage());
+ 	for (uint32_t i = 0; i < svc->getDeviceMemoryCount() && i < 8; i++) {
+ 		auto m = svc->getDeviceMemoryWithIndex(i);
+ 		if (!m)
+@@ -308,15 +311,27 @@ void probe(IOService *svc, bool retry) {
+ 		return;
+ 	}
+ 	// Last resort: the BAR value itself. 64 KiB covers every register this file reads (highest:
+-	// GCMC_VM_FB_OFFSET at byte a51c); the real BAR is larger. Kept for the lifetime of the kext.
++	// GCMC_VM_FB_OFFSET at byte a51c); the real BAR is larger. This descriptor is ours and is
++	// released when the probe ends; one taken from the device memory list belongs to the nub.
++	IOMemoryDescriptor *own = nullptr;
+ 	if (!regs && bar[5] && !(bar[5] & 7)) {
+-		regs = IOMemoryDescriptor::withPhysicalAddress(bar[5] & ~0xFULL, 0x10000, kIODirectionInOut);
++		regs = own = IOMemoryDescriptor::withPhysicalAddress(bar[5] & ~0xFULL, 0x10000, kIODirectionInOut);
+ 		LOG("probe: BAR 5 not in the device memory list, using phys %llx length 10000 directly%s",
+ 		    static_cast<uint64_t>(bar[5] & ~0xFULL), regs ? "" : ": FAILED");
+ 	}
++	if (regs)
++		readTable(regs, bar[5]);
++	else
++		LOG("probe: FAIL register BAR 5 (%08x) has no device memory", bar[5]);
++	if (own)
++		own->release();
++}
++
++// Everything that touches the registers, given the descriptor of the register BAR.
++void readTable(IOMemoryDescriptor *regs, uint32_t bar5) {
+ 	uint32_t memSize = 0, fbOff = 0;
+-	if (!regs || !regRead(regs, RegMemSize, memSize) || !regRead(regs, RegFbOffset, fbOff)) {
+-		LOG("probe: FAIL register BAR 5 (%08x) %s", bar[5], regs ? "too small or not mappable" : "has no device memory");
++	if (!regRead(regs, RegMemSize, memSize) || !regRead(regs, RegFbOffset, fbOff)) {
++		LOG("probe: FAIL register BAR 5 (%08x) too small or not mappable", bar5);
+ 		return;
+ 	}
+ 	LOG("probe: RCC_CONFIG_MEMSIZE %08x (MB) GCMC_VM_FB_OFFSET %08x", memSize, fbOff);
+-- 
+2.39.5 (Apple Git-154)
+

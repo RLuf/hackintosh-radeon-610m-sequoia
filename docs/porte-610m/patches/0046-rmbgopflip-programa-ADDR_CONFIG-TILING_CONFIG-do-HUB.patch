@@ -1,0 +1,100 @@
+From 4623b0b7867bef15e92a654557d929aaf5bbfa13 Mon Sep 17 00:00:00 2001
+From: fzmac <fzmac@localhost>
+Date: Thu, 26 Nov 2026 22:51:42 -0300
+Subject: [PATCH 46/48] -rmbgopflip programa ADDR_CONFIG/TILING_CONFIG do HUBP0
+ com o tiling do flip, como o hubp3_program_tiling (0040)
+
+Co-authored-by: opus-fable
+---
+ src/RembrandtGfx/display.cpp    | 40 +++++++++++++++++++++++++++++++++
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ src/RembrandtGfx/mmio.cpp       |  2 +-
+ 3 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 511ed3e..e6dff76 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3466,6 +3466,45 @@ volatile uint64_t gFlipLast, gFlipLastMc;
+ // accelerator). So the flip+8 pointer from the first accepted 'amtr' is re-read on every tick (one
+ // per frame) and HUBP0 reprogrammed when it changes, as Radeonized's hubpPoll does on vblank.
+ volatile uint64_t gFlipPtr;
++// Patch 0040 (-rmbgopflip): the compositor's surfaces are tiled, HUBP0 still had the GOP's linear
++// layout (TILING_CONFIG 0x80, ADDR_CONFIG 0), hence the striped panel. Apple's DAL programs them from
++// the same _AMD_PIPE_FLIP: AMDNavi23Display::fillFlipTilingParameters (bed741a) fills param+0x28..0x38
++// = num_pipes, pipe interleave field, max compressed frags, num pkrs, swizzle mode, and
++// writeFlipParameters copies param to flip+0x08, so they sit at flip+0x30/0x34/0x38/0x3c/0x40
++// (measured: 2, 0, 2, 1 for GB_ADDR_CONFIG 0x41). Program them as Linux's hubp3_program_tiling does
++// (dcn30_hubp.c:319): ADDR_CONFIG NUM_PIPES=log2, PIPE_INTERLEAVE, MAX_COMPRESSED_FRAGS=log2,
++// NUM_PKRS=log2 (shifts 0/6/12/16); TILING_CONFIG SW_MODE (bits 4:0), META_LINEAR and PIPE_ALIGNED
++// (bits 9/11) cleared, DIM_TYPE kept. Written before the address so the flip latches them together;
++// only when the value changes. Anything out of range leaves both registers alone.
++volatile uint32_t gTilingLast = 0xffffffff, gAddrCfgLast = 0xffffffff;
++void flipTiling() {
++	constexpr uint32_t D = 0x34C0;
++	if (!gFlipPtr)
++		return;
++	auto f = reinterpret_cast<const volatile uint32_t *>(gFlipPtr - 8);
++	uint32_t pipes = f[0x30 / 4], ilv = f[0x34 / 4], frags = f[0x38 / 4], pkrs = f[0x3c / 4], sw = f[0x40 / 4];
++	auto lg = [](uint32_t v) { int n = -1; for (int i = 0; i < 7; i++) if (v == (1u << i)) n = i; return n; };
++	int lp = lg(pipes), lf = lg(frags), lk = lg(pkrs);
++	static uint32_t bad;
++	if (lp < 0 || lf < 0 || lk < 0 || ilv > 3 || sw > 31) {
++		if (bad++ < 5)
++			LOG("gopfb: flip tiling out of range (pipes %u ilv %u frags %u pkrs %u sw %u): tiling left alone", pipes, ilv, frags, pkrs, sw);
++		return;
++	}
++	uint32_t addrCfg = static_cast<uint32_t>(lp) | (ilv << 6) | (static_cast<uint32_t>(lf) << 12) | (static_cast<uint32_t>(lk) << 16);
++	uint32_t cur = mmioRead(D + 0x5e7);
++	uint32_t tiling = (cur & ~(0x1fu | (1u << 9) | (1u << 11))) | sw;
++	if (addrCfg == gAddrCfgLast && tiling == gTilingLast)
++		return;
++	static uint32_t changes;
++	if (changes++ < 10)
++		LOG("gopfb: flip tiling: pipes %u ilv %u frags %u pkrs %u sw %u -> ADDR_CONFIG %x (was %x) TILING_CONFIG %x (was %x)", pipes, ilv, frags,
++		    pkrs, sw, addrCfg, mmioRead(D + 0x5e6), tiling, cur);
++	mmioWrite(D + 0x5e6, addrCfg);
++	mmioWrite(D + 0x5e7, tiling);
++	gAddrCfgLast = addrCfg, gTilingLast = tiling;
++}
++
+ void gopFlipProgram(uint64_t a) {
+ 	constexpr uint64_t Vram = 0x80000000ULL;  // 2 GB carve-out
+ 	uint64_t need = static_cast<uint64_t>(gMode.rowBytes) * gMode.h, base = gMode.fbBaseMc, mc = 0;
+@@ -3473,6 +3512,7 @@ void gopFlipProgram(uint64_t a) {
+ 		mc = a;
+ 	gFlipLast = a;
+ 	if (mc && !(mc & 0xff)) {
++		flipTiling();
+ 		mmioWrite(0x3acb, static_cast<uint32_t>(mc >> 32) & 0xffff);
+ 		mmioWrite(0x3aca, static_cast<uint32_t>(mc));
+ 		gFlipLastMc = mc;
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 0d8638d..137bdda 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1317,7 +1317,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0039, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0040, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/mmio.cpp b/src/RembrandtGfx/mmio.cpp
+index 0d42580..5f9bac8 100644
+--- a/src/RembrandtGfx/mmio.cpp
++++ b/src/RembrandtGfx/mmio.cpp
+@@ -78,7 +78,7 @@ static bool stage3MayWrite(uint32_t reg) {
+ // dcn_3_1_6_offset.h), written by gopfb's 'amtr' flip. Nothing else of the DCN.
+ bool gGopFlipWrites;
+ static bool gopFlipMayWrite(uint32_t reg) {
+-	return gGopFlipWrites && rmbStage() == 3 && rmbStage3Armed() && (reg == 0x3aca || reg == 0x3acb);
++	return gGopFlipWrites && rmbStage() == 3 && rmbStage3Armed() && (reg == 0x3aca || reg == 0x3acb || reg == 0x3aa6 || reg == 0x3aa7);  // + HUBP0 ADDR/TILING_CONFIG (0040)
+ }
+ 
+ void mmioWrite(uint32_t reg, uint32_t value) {
+-- 
+2.39.5 (Apple Git-154)
+

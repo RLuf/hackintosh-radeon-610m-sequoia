@@ -1,0 +1,653 @@
+From 9cbaee7c6b58ecd909073feb1120047ac30b21fa Mon Sep 17 00:00:00 2001
+From: fzmac porte <noreply@example.invalid>
+Date: Thu, 19 Nov 2026 20:12:57 +0000
+Subject: [PATCH 01/48] =?UTF-8?q?feat:=20M1=20do=20porte=20610M=20-=20anex?=
+ =?UTF-8?q?a=20=C3=A0=201002:1506=20em=20modo=20sonda=20e=20l=C3=AA=20a=20?=
+ =?UTF-8?q?tabela=20de=20IPs?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Marco M1 do mapa de porte (docs/PORTING-MAP-610m.md do fzmacscript):
+o menor conjunto de mudanças para o plugin reconhecer a Radeon 610M
+"Mendocino" (1002:1506, rev. C1) e registrar a tabela de IPs.
+
+- S01: identidade PCI 0x1681 -> 0x1506 e 0x16811002 -> 0x15061002 nos
+  ganchos de leitura de configuração (kern_start.cpp) e no teste de
+  espaço de usuário (tests/pci-identity.cpp).
+- Novo modo sonda (-rmbprobe), LIGADO por padrão; -rmbnoprobe desliga;
+  se os dois forem passados, -rmbprobe vence. No modo sonda o plugin
+  não altera código do kernel nem de outro kext e não escreve no espaço
+  de configuração PCI nem no roteador USB4: pciPublished não toca em
+  COMMAND nem nos anéis IH; mmioWrite, vramWrite32 e a leitura indireta
+  de mmio.cpp viram no-op; o BAR de registros de mmio.cpp é mapeado só
+  para leitura; usb4SleepStart, sleepRoute, umdRoute, o patch do
+  AppleUSBXHCI, a rota de OSKext::start (e com ela todos os ganchos de
+  HWLibs, Framebuffer, acelerador, AppleBacklight, IOPCIFamily e
+  NVAccel) e o keepPanic ficam fora.
+- Novo ipdisc.cpp: ao publicar a 1002:1506 registra ID, revisão,
+  COMMAND, BARs e memórias do dispositivo; se o bit de memória do
+  COMMAND já estiver ligado, lê RCC_CONFIG_MEMSIZE e GCMC_VM_FB_OFFSET
+  por mapeamento só-leitura do BAR 5 e copia a tabela de descoberta do
+  offset de VRAM (MEMSIZE << 20) - 0x10000 pelo par MM_INDEX/MM_DATA,
+  como o amdgpu_device_mm_access do Linux. Valida as assinaturas
+  0x28211407 e 0x53445049 e os checksums e imprime uma linha
+  "probe: ip" por IP. Toda leitura da cópia tem checagem de limites; em
+  qualquer divergência registra o que achou e retorna. Com o bit de
+  memória desligado não toca em nada e tenta uma vez 20 s depois.
+
+ÚNICAS escritas em hardware no modo sonda: MM_INDEX (dword 0) e
+MM_INDEX_HI (dword 6), só dentro de mmCopy() em ipdisc.cpp, salvos antes
+e restaurados depois; a leitura para na primeira palavra se não for a
+assinatura e nunca passa de 10 KB. -rmbprobero pula até essas duas.
+
+Motivo da leitura por MM_INDEX: medição no Linux na máquina real
+(MEMSIZE 0x800, FB_OFFSET 0x3c0) mostrou que a CPU lê 0xffffffff no
+endereço físico da tabela (0x43fff0000), e que o par MM_INDEX/MM_DATA
+devolve o binário correto. A leitura física ficou só como conferência
+registrada de 4 palavras, fora do critério de aprovação.
+
+Com -rmbnoprobe o comportamento é o do upstream 87a01b5, só com a
+identidade nova.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSn5SmsfPKALaTRZ7W5
+---
+ src/RembrandtGfx/Makefile               |   2 +-
+ src/RembrandtGfx/ipdisc.cpp             | 306 ++++++++++++++++++++++++
+ src/RembrandtGfx/kern_start.cpp         |  27 ++-
+ src/RembrandtGfx/mmio.cpp               |  16 +-
+ src/RembrandtGfx/probe.cpp              |   2 +-
+ src/RembrandtGfx/rmb.hpp                |   7 +
+ src/RembrandtGfx/sleep.cpp              |   2 +-
+ src/RembrandtGfx/tests/pci-identity.cpp |  11 +-
+ src/RembrandtGfx/umdpatch.cpp           |   2 +-
+ src/RembrandtGfx/usb4.cpp               |   2 +-
+ 10 files changed, 355 insertions(+), 22 deletions(-)
+ create mode 100644 src/RembrandtGfx/ipdisc.cpp
+
+diff --git a/src/RembrandtGfx/Makefile b/src/RembrandtGfx/Makefile
+index 2306032..6d8e563 100644
+--- a/src/RembrandtGfx/Makefile
++++ b/src/RembrandtGfx/Makefile
+@@ -11,7 +11,7 @@ KFLAGS := -target x86_64-apple-macos10.15 -mkernel -nostdinc -fno-builtin -fno-c
+ CXXFLAGS := $(KFLAGS) -std=c++17 -fapple-kext -nostdlib -fno-rtti -fno-exceptions \
+             -fno-use-cxa-atexit -mllvm -disable-atexit-based-global-dtor-lowering \
+             -DPRODUCT_NAME=$(NAME) -DMODULE_VERSION=$(VER) -Wno-deprecated-declarations
+-OBJS   := kern_start.o mmio.o smu.o golden.o dmub.o display.o firmware.o probe.o vmwatch.o sleep.o usb4.o umdpatch.o disklog.o vramcrc.o nvcopy.o fw.o plugin_start.o info.o
++OBJS   := kern_start.o mmio.o smu.o golden.o dmub.o display.o firmware.o probe.o vmwatch.o sleep.o usb4.o umdpatch.o disklog.o vramcrc.o nvcopy.o ipdisc.o fw.o plugin_start.o info.o
+ KEXT   := $(NAME).kext/Contents
+ 
+ all: $(KEXT)/MacOS/$(NAME)
+diff --git a/src/RembrandtGfx/ipdisc.cpp b/src/RembrandtGfx/ipdisc.cpp
+new file mode 100644
+index 0000000..14942ea
+--- /dev/null
++++ b/src/RembrandtGfx/ipdisc.cpp
+@@ -0,0 +1,306 @@
++//
++//  ipdisc.cpp: 610M port, milestone M1. Probe of the Radeon 610M "Mendocino" (1002:1506).
++//
++//  When the GPU's PCI nub is published: log its ID, revision, COMMAND and BARs and, only if memory
++//  decode is already on, read the IP discovery table through MM_INDEX/MM_DATA and print one
++//  "probe: ip" line per IP, to diff against Linux's ip_discovery sysfs tree.
++//
++//  HARDWARE WRITES: exactly two registers, MM_INDEX (dword 0) and MM_INDEX_HI (dword 6), in mmCopy()
++//  below and nowhere else. Both are read first and written back afterwards. Config space is only
++//  read; every other mapping here is kIOMapReadOnly; the table is parsed from a copy with every offset
++//  checked first. On any mismatch: log what was found and return. -rmbprobero skips mmCopy (no write
++//  at all: identity, BARs, the two size registers and the cross-check only).
++//
++//  FACT (Linux v6.12, drivers/gpu/drm/amd/):
++//   - the register BAR is PCI BAR 5 (amdgpu/amdgpu_device.c:4157-4158);
++//   - mmRCC_CONFIG_MEMSIZE (dword 0xde3) is the VRAM size in MB; the discovery binary is the 10 KB at
++//     VRAM offset size - 64 KB (amdgpu/amdgpu_discovery.c:118,285-290, amdgpu_discovery.h:27-28);
++//   - at init Linux reads it with MM_INDEX = (u32)pos | 0x80000000, MM_INDEX_HI = pos >> 31, value in
++//     MM_DATA, dwords 0x0 / 0x6 / 0x1 (amdgpu/amdgpu_device.c:456-488, amdgpu_discovery.c:120-122),
++//     because the VRAM aperture is not mapped yet (amdgpu_device.c:508-509,549-563);
++//   - layouts of binary_header, ip_discovery_header, die_header, ip and the signatures 0x28211407 /
++//     0x53445049 (include/discovery.h:28-29,56-152); checksums are byte sums
++//     (amdgpu/amdgpu_discovery.c:326-341,447-477); 64-bit bases print as low 32 bits & 0x3FFFFFFF (:1093-1095);
++//   - VRAM offset 0 is system physical address GCMC_VM_FB_OFFSET << 24 (amdgpu/gfxhub_v2_1.c:118-121,
++//     gmc_v10_0.c:623-624,687,721-722; mmGCMC_VM_FB_OFFSET = 0x16e7, gc_10_3_0_offset.h:3638).
++//  FACT (measured on the 82X5 under Linux 6.18 with amdgpu loaded, 2026-11-19, as reported to the
++//  author of this file; evidence on the machine in /mnt/dados/fzwork/evidencias/linux-amdgpu-20261119/):
++//   - RCC_CONFIG_MEMSIZE = 0x800; dword 0x1260 + 0x16e7 = 0x3c0, so the carve-out starts at physical
++//     0x3c0000000 and the table's physical address is 0x43fff0000;
++//   - a CPU read of that position through the aperture returns 0xffffffff for every word: the
++//     region is closed to the host CPU, so a physical read cannot be the source of the table;
++//   - the MM_INDEX/MM_DATA read at VRAM offset 0x7fff0000 returns 28211407 00010001 04344d63 464a003c
++//     ..., identical to the kernel's own copy; 0x53445049 is at byte 60.
++//  HYPOTHESIS (this probe is the test):
++//   - the same MM_INDEX read works under macOS with no driver attached, and nothing else uses
++//     MM_INDEX meanwhile (no AMD kext is loaded in the M1 configuration; mmCopy takes no lock);
++//   - memory decode is already on at publish (the comment above pciPublished in mmio.cpp says it was
++//     not on the 680M). If it is off, nothing is touched and one retry runs 20 s later.
++//
++
++#include "rmb.hpp"
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IODeviceMemory.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/pci/IOPCIDevice.h>
++#include <kern/thread.h>
++#include <libkern/c++/OSData.h>
++
++// -rmbprobe: bring-up mode, ON by default in this port. -rmbnoprobe turns it off (full driver, as
++// upstream); if both are given, -rmbprobe wins.
++bool rmbProbe() {
++	static int on = -1;
++	if (on < 0)
++		on = checkKernelArgument("-rmbprobe") || !checkKernelArgument("-rmbnoprobe");
++	return on;
++}
++
++namespace {
++
++constexpr uint32_t RegMemSize = 0xde3, RegFbOffset = 0x1260 + 0x16e7;      // dword indices, read only
++constexpr uint32_t RegMmIndex = 0x0, RegMmIndexHi = 0x6, RegMmData = 0x1;  // index, index hi: written; data: read
++constexpr uint32_t BinSize = 10 << 10, BinTop = 64 << 10;                   // DISCOVERY_TMR_SIZE, _OFFSET
++constexpr uint32_t BinSig = 0x28211407, TableSig = 0x53445049;
++constexpr uint32_t MaxDies = 16, MaxIps = 256, MaxBases = 16;               // die_info[16]; log volume caps
++constexpr IOOptionBits MapRo = kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly;
++
++uint8_t gBin[BinSize];  // copy of the table: all parsing reads this, never the hardware
++uint32_t gLen;          // bytes of gBin that were really read (<= BinSize); the rest is zero
++
++// Is [off, off + n) inside what was read? Checked before every le16/le32/byteSum below.
++bool inBin(uint32_t off, uint32_t n) { return off <= gLen && n <= gLen - off; }
++uint32_t le16(uint32_t off) { return gBin[off] | static_cast<uint32_t>(gBin[off + 1]) << 8; }
++uint32_t le32(uint32_t off) { return le16(off) | le16(off + 2) << 16; }
++uint32_t byteSum(uint32_t off, uint32_t n) {
++	uint32_t s = 0;
++	for (uint32_t i = 0; i < n; i++)
++		s += gBin[off + i];
++	return s & 0xFFFF;
++}
++
++// THE ONLY HARDWARE WRITES OF PROBE MODE. Copies the discovery binary at VRAM offset pos into gBin
++// through MM_INDEX / MM_INDEX_HI / MM_DATA, as Linux amdgpu_device_mm_access does. r = page 0 of the
++// register BAR. MM_INDEX and MM_INDEX_HI are saved first (idx, hi) and written back last. Stops
++// after the first word if it is not the binary signature, after the third if the size field is out
++// of range, else at the binary's own size; never more than BinSize. No sleep, yield or log between
++// an index write and its data read. (A template only so the userspace test can pass a fake page.)
++template <typename Regs>
++void mmCopy(Regs &r, uint64_t pos, uint32_t &idx, uint32_t &hi) {
++	memset(gBin, 0, sizeof(gBin));
++	gLen = 0;
++	idx = r[RegMmIndex];
++	hi = r[RegMmIndexHi];
++	uint32_t limit = BinSize, curHi = ~0u;
++	for (uint32_t off = 0; off < limit; off += 4) {
++		uint64_t p = pos + off;
++		r[RegMmIndex] = static_cast<uint32_t>(p) | 0x80000000u;
++		if (static_cast<uint32_t>(p >> 31) != curHi) {
++			curHi = static_cast<uint32_t>(p >> 31);
++			r[RegMmIndexHi] = curHi;
++		}
++		uint32_t v = r[RegMmData];
++		memcpy(gBin + off, &v, sizeof(v));
++		gLen = off + 4;
++		if (off == 0 && v != BinSig)
++			break;
++		if (off == 8) {  // binary_size is the high half of the third word
++			if ((v >> 16) < 20 || (v >> 16) > BinSize)
++				break;
++			limit = ((v >> 16) + 3) & ~3u;
++		}
++	}
++	r[RegMmIndex] = idx;
++	r[RegMmIndexHi] = hi;
++}
++
++// binary_header: +0 signature, +4 version, +8 checksum of [10, size), +10 size, +12 table_list[0]
++// {offset, checksum}. ip_discovery_header (80 B): +0 signature, +4 version, +6 size, +12 num_dies,
++// +14 die_info[16] {id, offset}, +78 bit 0 = 64-bit bases. die_header: {id, num_ips}. ip (8 B +
++// bases): hw_id, instance, num_base_address, major, minor, revision, (sub-revision/variant).
++void parse(uint64_t pos) {
++	if (gLen < 4 || le32(0) != BinSig) {
++		LOG("probe: FAIL no binary signature at VRAM offset %llx: first word %08x (want %08x), %u bytes read", pos,
++		    le32(0), BinSig, gLen);
++		return;
++	}
++	uint32_t size = le16(10), sum = le16(8), tOff = le16(12), tSum = le16(14);
++	if (size < 20 || size > gLen || byteSum(10, size - 10) != sum) {
++		LOG("probe: FAIL binary size %u checksum %04x (computed %04x), %u bytes read", size, sum,
++		    size >= 20 && size <= gLen ? byteSum(10, size - 10) : 0, gLen);
++		return;
++	}
++	if (!tOff || !inBin(tOff, 80) || le32(tOff) != TableSig) {
++		LOG("probe: FAIL ip table at +%x: signature %08x (want %08x)", tOff, inBin(tOff, 4) ? le32(tOff) : 0, TableSig);
++		return;
++	}
++	uint32_t tSize = le16(tOff + 6), dies = le16(tOff + 12);
++	bool b64 = gBin[tOff + 78] & 1;
++	if (tSize < 80 || !inBin(tOff, tSize) || byteSum(tOff, tSize) != tSum || dies > MaxDies) {
++		LOG("probe: FAIL ip table size %u checksum %04x (computed %04x) dies %u", tSize, tSum,
++		    tSize >= 80 && inBin(tOff, tSize) ? byteSum(tOff, tSize) : 0, dies);
++		return;
++	}
++	LOG("probe: discovery binary at VRAM offset %llx: v%u.%u size %u; ip table +%x v%u size %u dies %u base64 %u, checksums ok",
++	    pos, le16(4), le16(6), size, tOff, le16(tOff + 4), tSize, dies, b64);
++	uint32_t total = 0;
++	for (uint32_t d = 0; d < dies; d++) {
++		uint32_t dOff = le16(tOff + 14 + d * 4 + 2);
++		if (!inBin(dOff, 4) || le16(dOff + 2) > MaxIps) {
++			LOG("probe: FAIL die %u header at +%x: outside the %u bytes read or num_ips %u > %u", d, dOff, gLen,
++			    inBin(dOff, 4) ? le16(dOff + 2) : 0, MaxIps);
++			return;
++		}
++		uint32_t ips = le16(dOff + 2), off = dOff + 4;
++		LOG("probe: die %u id %u at +%x num_ips %u", d, le16(dOff), dOff, ips);
++		for (uint32_t i = 0; i < ips; i++, total++) {
++			uint32_t nb = inBin(off, 8) ? gBin[off + 3] : 0, len = 8 + nb * (b64 ? 8 : 4);
++			if (!inBin(off, len)) {
++				LOG("probe: FAIL die %u ip %u at +%x (%u bases) is outside the %u bytes read", d, i, off, nb, gLen);
++				return;
++			}
++			char bases[MaxBases * 11 + 1];
++			int k = 0;
++			bases[0] = '\0';
++			for (uint32_t b = 0; b < nb && b < MaxBases; b++)
++				k += snprintf(bases + k, sizeof(bases) - k, "%s0x%08X", b ? " " : "",
++				              b64 ? le32(off + 8 + b * 8) & 0x3FFFFFFF : le32(off + 8 + b * 4));
++			LOG("probe: ip die%u %u/%u hw_id=%u v=%u.%u.%u bases=%s%s", d, le16(off), gBin[off + 2], le16(off),
++			    gBin[off + 4], gBin[off + 5], gBin[off + 6], bases, nb > MaxBases ? " ..." : "");
++			off += len;
++		}
++	}
++	LOG("probe: OK %u dies, %u ips listed", dies, total);
++}
++
++uint32_t dataU32(IORegistryEntry *e, const char *key) {
++	auto d = OSDynamicCast(OSData, e->getProperty(key));
++	return d && d->getLength() >= 4 ? *static_cast<const uint32_t *>(d->getBytesNoCopy()) : 0;
++}
++
++// One register (dword index) through a read-only one-page mapping of the register BAR.
++bool regRead(IODeviceMemory *mem, uint32_t reg, uint32_t &value) {
++	uint64_t off = static_cast<uint64_t>(reg) * 4, page = off & ~0xFFFULL;
++	if (page + 0x1000 > mem->getLength())
++		return false;
++	auto map = mem->createMappingInTask(kernel_task, 0, MapRo, page, 0x1000);
++	if (!map)
++		return false;
++	value = *reinterpret_cast<const volatile uint32_t *>(map->getVirtualAddress() + (off & 0xFFF));
++	map->release();
++	return true;
++}
++
++// The table by MM_INDEX. Page 0 of the register BAR is the only mapping in this file that is not
++// read-only; it exists for the duration of mmCopy and nothing else uses it for writing.
++bool mmRead(IODeviceMemory *mem, uint64_t pos) {
++	if (mem->getLength() < 0x1000)
++		return false;
++	auto map = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 0x1000);
++	if (!map)
++		return false;
++	auto r = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
++	uint32_t idx = 0, hi = 0;
++	mmCopy(r, pos, idx, hi);
++	uint32_t idxNow = r[RegMmIndex], hiNow = r[RegMmIndexHi];
++	map->release();
++	LOG("probe: MM_INDEX %08x MM_INDEX_HI %08x saved, %u bytes read at VRAM offset %llx, now %08x %08x: %s", idx, hi,
++	    gLen, pos, idxNow, hiNow, idxNow == idx && hiNow == hi ? "restored" : "RESTORE MISMATCH");
++	return true;
++}
++
++// Cross-check only: never the source of the table and not part of pass/fail. What the CPU sees at
++// the table's physical address (read-only uncached mapping, as vramcrc.cpp:81-87). Linux: ffffffff.
++void physPeek(uint64_t pa) {
++	auto md = IOMemoryDescriptor::withPhysicalAddress(pa, 0x1000, kIODirectionIn);
++	auto map = md ? md->createMappingInTask(kernel_task, 0, MapRo) : nullptr;
++	if (md)
++		md->release();
++	if (!map) {
++		LOG("probe: cross-check: could not map phys %llx read-only", pa);
++		return;
++	}
++	auto p = reinterpret_cast<const volatile uint32_t *>(map->getVirtualAddress());
++	uint32_t w[4] {p[0], p[1], p[2], p[3]};
++	map->release();
++	LOG("probe: cross-check: CPU read of phys %llx gives %08x %08x %08x %08x (Linux: ffffffff, region closed to the CPU)",
++	    pa, w[0], w[1], w[2], w[3]);
++}
++
++void probe(IOService *svc, bool retry);
++
++void retryThread(void *arg, wait_result_t) {
++	auto svc = static_cast<IOService *>(arg);
++	IOSleep(20000);
++	probe(svc, true);
++	svc->release();
++	thread_terminate(current_thread());
++}
++
++void probe(IOService *svc, bool retry) {
++	auto pci = static_cast<IOPCIDevice *>(svc);  // virtual calls only, as mmio.cpp
++	IOPCIAddressSpace sp;
++	sp.bits = dataU32(svc, "reg") & 0x00FFFF00;  // bus/device/function, config space
++	uint32_t id = pci->configRead32(sp, static_cast<UInt8>(kIOPCIConfigVendorID)), bar[6];
++	uint16_t cmd = pci->configRead16(sp, static_cast<UInt8>(kIOPCIConfigCommand));
++	bool mem = cmd & kIOPCICommandMemorySpace;
++	LOG("probe: %04x:%04x rev %02x at %02x:%02x.%x command %04x (memory decode %s)%s", id & 0xFFFF, id >> 16,
++	    pci->configRead8(sp, static_cast<UInt8>(kIOPCIConfigRevisionID)), sp.s.busNum, sp.s.deviceNum,
++	    sp.s.functionNum, cmd, mem ? "on" : "OFF", retry ? ", retry +20 s" : "");
++	for (uint32_t i = 0; i < 6; i++)
++		bar[i] = pci->configRead32(sp, static_cast<UInt8>(kIOPCIConfigBaseAddress0 + i * 4));
++	LOG("probe: BAR0-5 %08x %08x %08x %08x %08x %08x", bar[0], bar[1], bar[2], bar[3], bar[4], bar[5]);
++	IODeviceMemory *regs = nullptr;
++	for (uint32_t i = 0; i < svc->getDeviceMemoryCount() && i < 8; i++) {
++		auto m = svc->getDeviceMemoryWithIndex(i);
++		if (!m)
++			continue;
++		uint64_t pa = m->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
++		LOG("probe: device memory %u: phys %llx length %llx", i, pa, static_cast<uint64_t>(m->getLength()));
++		if (!regs && bar[5] && !(bar[5] & 7) && pa == (bar[5] & ~0xFULL))  // BAR 5: 32-bit memory BAR
++			regs = m;
++	}
++	if (id != 0x15061002) {
++		LOG("probe: not 1002:1506, registers not touched");
++		return;
++	}
++	if (!mem) {
++		LOG("probe: memory decode is off, registers not touched%s", retry ? "" : "; one retry in 20 s");
++		thread_t t;
++		if (retry)
++			return;
++		svc->retain();
++		if (kernel_thread_start(retryThread, svc, &t) == KERN_SUCCESS)
++			thread_deallocate(t);
++		else
++			svc->release();
++		return;
++	}
++	uint32_t memSize = 0, fbOff = 0;
++	if (!regs || !regRead(regs, RegMemSize, memSize) || !regRead(regs, RegFbOffset, fbOff)) {
++		LOG("probe: FAIL register BAR 5 (%08x) %s", bar[5], regs ? "too small or not mappable" : "has no device memory");
++		return;
++	}
++	LOG("probe: RCC_CONFIG_MEMSIZE %08x (MB) GCMC_VM_FB_OFFSET %08x", memSize, fbOff);
++	if (!memSize || memSize > 0x10000) {
++		LOG("probe: FAIL implausible RCC_CONFIG_MEMSIZE, nothing written");
++		return;
++	}
++	uint64_t pos = (static_cast<uint64_t>(memSize) << 20) - BinTop;
++	if (checkKernelArgument("-rmbprobero"))
++		LOG("probe: -rmbprobero: MM_INDEX not touched, table at VRAM offset %llx not read", pos);
++	else if (!mmRead(regs, pos))
++		LOG("probe: FAIL could not map page 0 of the register BAR, nothing written");
++	else
++		parse(pos);
++	if (fbOff != 0xFFFFFFFF && (fbOff & 0xFFFFFF))
++		physPeek((static_cast<uint64_t>(fbOff & 0xFFFFFF) << 24) + pos);
++	else
++		LOG("probe: cross-check skipped, implausible GCMC_VM_FB_OFFSET");
++}
++
++}  // namespace
++
++void ipDiscProbe(IOService *svc) {
++	probe(svc, false);
++}
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 9f88830..8df7659 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -783,6 +783,8 @@ static void routePciDevid(KernelPatcher &patcher, size_t index, mach_vm_address_
+ // primaryInterrupt handles Transfer Events the same way ioInterrupt does (slot/endpoint dispatch).
+ // Isochronous TRBs (interrupter 2) are left alone. `-rmbxhciintr1` = keep interrupter 1.
+ static void xhciPrimaryInterrupter(mach_vm_address_t address, size_t size) {
++	if (rmbProbe())
++		return;  // probe mode: AppleUSBXHCI stays unpatched
+ 	if (checkKernelArgument("-rmbxhciintr1")) {
+ 		LOG("xhciintr: disabled (-rmbxhciintr1)");
+ 		return;
+@@ -836,7 +838,7 @@ static bool kinfoReady(size_t i) {
+ }
+ 
+ static void scanKmods() {
+-	if (!gKmods)
++	if (!gKmods || rmbProbe())  // probe mode: no kext is hooked or patched
+ 		return;
+ 	static bool agdcFound, xhciFound, nvFound;
+ 	for (auto kmod = *gKmods; kmod; kmod = kmod->next) {
+@@ -897,7 +899,7 @@ static uint32_t rembrandtPciRevision(void *dev, uint64_t off, uint32_t value) {
+ 	if (off != kIOPCIConfigRevisionID || (value & 0xFF) != 0x02)
+ 		return value;
+ 	auto read16 = reinterpret_cast<uint16_t (*)(void *, uint64_t)>(orgPciRead16);
+-	if (read16(dev, kIOPCIConfigVendorID) != 0x1002 || read16(dev, kIOPCIConfigDeviceID) != 0x1681)
++	if (read16(dev, kIOPCIConfigVendorID) != 0x1002 || read16(dev, kIOPCIConfigDeviceID) != 0x1506)
+ 		return value;
+ 	if (!gRevisionLogged)
+ 		gRevisionLogged = true, LOG("pcidevid: PCI revision 02 -> c7");
+@@ -911,9 +913,9 @@ static uint8_t wrapPciRead8(void *dev, uint64_t off) {
+ 
+ static uint16_t wrapPciRead16(void *dev, uint64_t off) {
+ 	auto v = FunctionCast(wrapPciRead16, orgPciRead16)(dev, off);
+-	if (off == kIOPCIConfigDeviceID && v == 0x1681 && FunctionCast(wrapPciRead16, orgPciRead16)(dev, 0) == 0x1002) {
++	if (off == kIOPCIConfigDeviceID && v == 0x1506 && FunctionCast(wrapPciRead16, orgPciRead16)(dev, 0) == 0x1002) {
+ 		if (!gDevidLogged)
+-			gDevidLogged = true, LOG("pcidevid: config read16 1681 -> 73ff");
++			gDevidLogged = true, LOG("pcidevid: config read16 1506 -> 73ff");
+ 		v = 0x73ff;
+ 	}
+ 	return rembrandtPciRevision(dev, off, v);
+@@ -921,9 +923,9 @@ static uint16_t wrapPciRead16(void *dev, uint64_t off) {
+ 
+ static uint32_t wrapPciRead32(void *dev, uint64_t off) {
+ 	auto v = FunctionCast(wrapPciRead32, orgPciRead32)(dev, off);
+-	if (off == kIOPCIConfigVendorID && v == 0x16811002) {
++	if (off == kIOPCIConfigVendorID && v == 0x15061002) {
+ 		if (!gDevidLogged)
+-			gDevidLogged = true, LOG("pcidevid: config read32 16811002 -> 73ff1002");
++			gDevidLogged = true, LOG("pcidevid: config read32 15061002 -> 73ff1002");
+ 		v = 0x73ff1002;
+ 	}
+ 	return rembrandtPciRevision(dev, off, v);
+@@ -952,17 +954,24 @@ static OSReturn wrapOSKextStart(void *kext, bool startDependencies) {
+ }
+ 
+ static void pluginStart() {
+-	LOG("starting");
++	// 610M port: probe mode (rmb.hpp) is on unless -rmbnoprobe. It keeps the PCI publish notifier (for
++	// the ipdisc.cpp probe) and the disk log; every code patch and every hardware write is skipped,
++	// except ipdisc.cpp's MM_INDEX / MM_INDEX_HI pair (saved and restored).
++	bool probe = rmbProbe();
++	LOG("starting%s", probe ? " in PROBE mode: no kext hooks, only MM_INDEX/MM_INDEX_HI written and restored (-rmbnoprobe = full driver)" : "");
+ 	ihQuiesceAtBoot();
+ 	usb4SleepStart();
+ 	// Registering the kexts makes Lilu build their symbol tables (kinfos) for us.
+-	lilu.onKextLoadForce(kexts, arrsize(kexts));
++	if (!probe)
++		lilu.onKextLoadForce(kexts, arrsize(kexts));
+ 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
+ 		gPatcher = &patcher;
+ 		gKmods = reinterpret_cast<kmod_info_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_kmod"));
+ 		LOG("patcher ready, kmod list %s, hwlibs kinfo %zu", gKmods ? "found" : "missing", kextHWLibs.loadIndex);
+ 		KernelPatcher::RouteRequest req {"__ZN6OSKext5startEb", wrapOSKextStart, orgOSKextStart};
+-		if (!patcher.routeMultiple(KernelPatcher::KernelID, &req, 1))
++		if (rmbProbe())
++			LOG("probe: OSKext::start not routed, sleep/umd/xhci/kext hooks not installed");
++		else if (!patcher.routeMultiple(KernelPatcher::KernelID, &req, 1))
+ 			LOG("failed to route OSKext::start (err %d)", patcher.getError());
+ 		patcher.clearError();
+ 		sleepRoute(patcher);
+diff --git a/src/RembrandtGfx/mmio.cpp b/src/RembrandtGfx/mmio.cpp
+index ec4118f..5d0ea6e 100644
+--- a/src/RembrandtGfx/mmio.cpp
++++ b/src/RembrandtGfx/mmio.cpp
+@@ -35,7 +35,7 @@ static bool mapMmio() {
+ 			auto mem = svc->getDeviceMemoryWithIndex(i);
+ 			if (!mem || mem->getLength() != RegApertureSize)
+ 				continue;
+-			gMmioMap = mem->map(kIOMapInhibitCache);
++			gMmioMap = mem->map(rmbProbe() ? kIOMapInhibitCache | kIOMapReadOnly : kIOMapInhibitCache);
+ 			if (gMmioMap) {
+ 				gMmio = reinterpret_cast<volatile uint32_t *>(gMmioMap->getVirtualAddress());
+ 				LOG("mapped register aperture (device memory %u)", i);
+@@ -55,6 +55,8 @@ uint32_t mmioRead(uint32_t reg) {
+ }
+ 
+ void mmioWrite(uint32_t reg, uint32_t value) {
++	if (rmbProbe())
++		return;  // probe mode: no register write, whoever asks
+ 	if (mapMmio() && reg < RegApertureSize / 4)
+ 		gMmio[reg] = value;
+ }
+@@ -105,6 +107,8 @@ static bool findVram() {
+ // Indirect VRAM access through MM_INDEX (0x0) / MM_DATA (0x1) / MM_INDEX_HI (0x6), as Linux
+ // amdgpu_device_mm_access does, for offsets beyond the CPU-visible BAR window.
+ static uint32_t vramReadIndirect32(uint64_t off) {
++	if (rmbProbe())
++		return 0xFFFFFFFF;  // probe mode: this read needs MM_INDEX writes
+ 	mmioWrite(0x0, static_cast<uint32_t>(off) | 0x80000000u);
+ 	mmioWrite(0x6, static_cast<uint32_t>(off >> 31));
+ 	return mmioRead(0x1);
+@@ -143,7 +147,7 @@ uint64_t vramRead64(uint64_t off) {
+ }
+ 
+ bool vramWrite32(uint64_t off, uint32_t value) {
+-	if (!findVram() || off + 4 > gVram->getLength())
++	if (rmbProbe() || !findVram() || off + 4 > gVram->getLength())
+ 		return false;
+ 	auto l = vramLock();
+ 	if (!l)
+@@ -164,7 +168,7 @@ bool vramWrite32(uint64_t off, uint32_t value) {
+ // whole boot crawls (restart3: AHCI command timeouts, vCPU in AppleAHCI::PrimaryInterruptHandler).
+ // Disable and drain the rings like Linux navi10_ih_disable_interrupts (-rmbnoihq: don't).
+ void quiesceIh(const char *why) {
+-	if (checkKernelArgument("-rmbnoihq"))
++	if (rmbProbe() || checkKernelArgument("-rmbnoihq"))
+ 		return;
+ 	static constexpr uint32_t Base = 0x10A0;
+ 	static constexpr struct { uint32_t cntl, rptr, wptr; } rings[] {{0x80, 0x83, 0x84}, {0x8c, 0x8f, 0x90}, {0x98, 0x9b, 0x9c}};
+@@ -204,6 +208,12 @@ static bool pciPublished(void *, void *, IOService *svc, IONotifier *) {
+ 	}
+ 	if (dataU32(svc, "vendor-id") != 0x1002 || (cls >> 16) != 0x03)
+ 		return true;
++	if (rmbProbe()) {
++		// Probe mode: COMMAND and the IH rings stay as the firmware left them. ipdisc.cpp reads, and
++		// writes only MM_INDEX / MM_INDEX_HI through its own mapping (saved and restored).
++		ipDiscProbe(svc);
++		return true;
++	}
+ 	auto pci = static_cast<IOPCIDevice *>(svc);
+ 	IOPCIAddressSpace sp;
+ 	sp.bits = dataU32(svc, "reg") & 0x00FFFF00;  // phys.hi: bus/device/function, config space
+diff --git a/src/RembrandtGfx/probe.cpp b/src/RembrandtGfx/probe.cpp
+index 12c5f85..1f9f781 100644
+--- a/src/RembrandtGfx/probe.cpp
++++ b/src/RembrandtGfx/probe.cpp
+@@ -708,7 +708,7 @@ void eoi0Probe(const char *why) {
+ 		}
+ 	}
+ 	panicKeep("%s", line);
+-	if (!ok)
++	if (!ok && !rmbProbe())
+ 		keepPanic();
+ 	busy = false;
+ }
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 449dab5..86293c2 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -15,6 +15,13 @@ extern "C" int printf(const char *fmt, ...) __printflike(1, 2);
+ // -rmbverbose: bulk bring-up tracing (DAL log, DAL write log, DMUB ring dumps, register
+ // snapshots). Off by default: ~1 MB of synchronous serial printf slows the whole boot.
+ bool rmbVerbose();
++// -rmbprobe (610M port, ON by default; -rmbnoprobe = off; -rmbprobe wins if both are given): bring-up
++// mode. No kernel or kext code patched, no write to PCI config space or to the USB4 router, and the
++// only GPU registers written are MM_INDEX and MM_INDEX_HI (saved and restored) by ipdisc.cpp, which
++// logs the PCI identity and the IP discovery table ("probe:" lines). -rmbprobero: not even those two.
++bool rmbProbe();
++class IOService;
++void ipDiscProbe(IOService *svc);
+ void safeModesLog();
+ // display.cpp: inject one DMUB inbox command (reply = slot contents after the fw consumed it); DAL link of the
+ // external DP/HDMI stream (0 = none).
+diff --git a/src/RembrandtGfx/sleep.cpp b/src/RembrandtGfx/sleep.cpp
+index bb571a0..ae31caf 100644
+--- a/src/RembrandtGfx/sleep.cpp
++++ b/src/RembrandtGfx/sleep.cpp
+@@ -20,7 +20,7 @@ static void wrapUpdatePreventSystemSleepList(void *root, IOService *svc, bool ad
+ }
+ 
+ void sleepRoute(KernelPatcher &patcher) {
+-	if (checkKernelArgument("-rmbsvgaveto"))
++	if (rmbProbe() || checkKernelArgument("-rmbsvgaveto"))
+ 		return;
+ 	KernelPatcher::RouteRequest req {"__ZN14IOPMrootDomain28updatePreventSystemSleepListEP9IOServiceb",
+ 	                                 wrapUpdatePreventSystemSleepList, orgUpdatePreventSystemSleepList};
+diff --git a/src/RembrandtGfx/tests/pci-identity.cpp b/src/RembrandtGfx/tests/pci-identity.cpp
+index b155cbc..b6cf662 100644
+--- a/src/RembrandtGfx/tests/pci-identity.cpp
++++ b/src/RembrandtGfx/tests/pci-identity.cpp
+@@ -37,23 +37,24 @@ int main() {
+ 	orgPciRead8 = reinterpret_cast<uintptr_t>(read8);
+ 	orgPciRead16 = reinterpret_cast<uintptr_t>(read16);
+ 	orgPciRead32 = reinterpret_cast<uintptr_t>(read32);
+-	auto gpu = config(0x1002, 0x1681, 0x03000002);
++	auto gpu = config(0x1002, 0x1506, 0x03000002);
+ 	expect("mapped PCI16 device ID", wrapPciRead16(&gpu, 2), 0x73ff);
+ 	expect("mapped PCI32 vendor/device", wrapPciRead32(&gpu, 0), 0x73ff1002);
+ 	expect("mapped PCI8 revision", wrapPciRead8(&gpu, 8), 0xc7);
+ 	expect("mapped PCI16 revision", wrapPciRead16(&gpu, 8), 0xc7);
+ 	expect("mapped PCI32 revision/class", wrapPciRead32(&gpu, 8), 0x030000c7);
+-	expect("raw config remains original", read32(&gpu, 0), 0x16811002);
++	expect("raw config remains original", read32(&gpu, 0), 0x15061002);
+ 	expect("raw revision remains original", read8(&gpu, 8), 2);
+ 	for (uint64_t off : {4, 9, 10, 12}) {
+ 		expect("unrelated PCI8 offset", wrapPciRead8(&gpu, off), read8(&gpu, off));
+ 		expect("unrelated PCI16 offset", wrapPciRead16(&gpu, off), read16(&gpu, off));
+ 		expect("unrelated PCI32 offset", wrapPciRead32(&gpu, off), read32(&gpu, off));
+ 	}
+-	auto upper = config(0x1002, 0x1681, 0x0300a502);
++	auto upper = config(0x1002, 0x1506, 0x0300a502);
+ 	expect("PCI16 preserves upper byte", wrapPciRead16(&upper, 8), 0xa5c7);
+ 	expect("PCI32 preserves class/programming interface", wrapPciRead32(&upper, 8), 0x0300a5c7);
+-	for (auto other : {config(0x1002, 0x164c, 0x03000002), config(0x10de, 0x1681, 0x03000002),
++	for (auto other : {config(0x1002, 0x164c, 0x03000002), config(0x10de, 0x1506, 0x03000002),
++	                   config(0x1002, 0x1681, 0x03000002),
+ 	                   config(0x8086, 0x1234, 0x03000002), config(0x1002, 0x73ff, 0x03000002)}) {
+ 		expect("other device PCI8", wrapPciRead8(&other, 8), 2);
+ 		expect("other device PCI16", wrapPciRead16(&other, 8), 2);
+@@ -62,7 +63,7 @@ int main() {
+ 		expect("other device identity PCI32", wrapPciRead32(&other, 0), read32(&other, 0));
+ 	}
+ 	for (auto revision : {0x00, 0x01, 0xc7, 0xff}) {
+-		auto other = config(0x1002, 0x1681, 0x03000000 | revision);
++		auto other = config(0x1002, 0x1506, 0x03000000 | revision);
+ 		expect("other revision PCI8", wrapPciRead8(&other, 8), revision);
+ 		expect("other revision PCI16", wrapPciRead16(&other, 8), revision);
+ 		expect("other revision PCI32", wrapPciRead32(&other, 8), 0x03000000 | revision);
+diff --git a/src/RembrandtGfx/umdpatch.cpp b/src/RembrandtGfx/umdpatch.cpp
+index b50415a..aa83039 100644
+--- a/src/RembrandtGfx/umdpatch.cpp
++++ b/src/RembrandtGfx/umdpatch.cpp
+@@ -77,7 +77,7 @@ void wrapCsValidatePage(void *vp, memory_object_t pager, memory_object_offset_t
+ }  // namespace
+ 
+ void umdRoute(KernelPatcher &patcher) {
+-	if (checkKernelArgument("-rmbnoxor0"))
++	if (rmbProbe() || checkKernelArgument("-rmbnoxor0"))
+ 		return;
+ 	KernelPatcher::RouteRequest req[] {
+ 		{"_cs_validate_page", wrapCsValidatePage, orgCsValidatePage},
+diff --git a/src/RembrandtGfx/usb4.cpp b/src/RembrandtGfx/usb4.cpp
+index fb510fd..e758045 100644
+--- a/src/RembrandtGfx/usb4.cpp
++++ b/src/RembrandtGfx/usb4.cpp
+@@ -298,7 +298,7 @@ bool nhiPublished(void *, void *, IOService *svc, IONotifier *) {
+ }  // namespace
+ 
+ void usb4SleepStart() {
+-	if (checkKernelArgument("-rmbnousb4sleep"))
++	if (rmbProbe() || checkKernelArgument("-rmbnousb4sleep"))
+ 		return;
+ 	gUsb4Lock = IOLockAlloc();
+ 	auto matching = IOService::serviceMatching("IOPCIDevice");
+-- 
+2.39.5 (Apple Git-154)
+

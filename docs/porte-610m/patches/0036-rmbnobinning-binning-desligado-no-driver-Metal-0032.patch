@@ -1,0 +1,114 @@
+From d225536dbc8c0b8edc963d8e719a62238f02b79e Mon Sep 17 00:00:00 2001
+From: Roger Luft <rluft@pop.local>
+Date: Thu, 26 Nov 2026 02:16:54 -0300
+Subject: [PATCH 36/48] -rmbnobinning: binning desligado no driver Metal (0032)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ src/RembrandtGfx/umdpatch.cpp   | 31 ++++++++++++++++++++++---------
+ 2 files changed, 23 insertions(+), 10 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 795f536..e1a3d66 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0031, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0032, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/umdpatch.cpp b/src/RembrandtGfx/umdpatch.cpp
+index fe6f52e..d363e93 100644
+--- a/src/RembrandtGfx/umdpatch.cpp
++++ b/src/RembrandtGfx/umdpatch.cpp
+@@ -31,7 +31,8 @@ struct WfPat {
+ 	size_t len, off;
+ 	uint8_t from, to;
+ 	const char *name;
+-	int arg;  // 0 = -rmbwalkfence2, 1 = -rmbpclines256
++	int arg;  // 0 = -rmbwalkfence2, 1 = -rmbpclines256, 2 = -rmbnobinning (full replacement in rep)
++	uint8_t rep[16];
+ };
+ const WfPat wfPats[] {
+ 	{{0x48, 0xc7, 0x43, 0x48, 0xb8, 0x01, 0x02, 0x06}, 8, 4, 0xb8, 0xa8, "render pipeline", 0},
+@@ -41,8 +42,15 @@ const WfPat wfPats[] {
+ 	// cache lines (Mesa ac_gpu_info.c). mov 0x78(%rdi),%eax; mov %eax,%ecx; shl $9,%ecx -> shl $8,%ecx
+ 	{{0x8b, 0x47, 0x78, 0x89, 0xc1, 0xc1, 0xe1, 0x09, 0xff, 0xc9, 0xba, 0xff, 0x03, 0x00, 0x00}, 15, 7, 0x09, 0x08,
+ 	 "GE_PC_ALLOC lines 512 -> 256", 1},
++	// Patch 0032 (-rmbnobinning): amdMtl_GFX10_UpdatePrimBatchBinning builds PA_SC_BINNER_CNTL_0 from
++	// mov $0x19ffe000,%ecx / mov $0x187fe000,%edx (BINNING_MODE 0, PERSISTENT_STATES_PER_BIN 0x1f); the
++	// Mesa disables binning on small chips' hangs and uses mode 2 when off (si_state_binning.c:409-425).
++	// -> mov $0x19fc0002 / $0x187c0002: BINNING_MODE 2 (DISABLE_BINNING_USE_NEW_SC), states per bin 0.
++	{{0xb9, 0x00, 0xe0, 0xff, 0x19, 0xba, 0x00, 0xe0, 0x7f, 0x18, 0x0f, 0x44, 0xd1}, 13, 0, 0, 0,
++	 "PA_SC_BINNER_CNTL_0 binning off (mode 2)", 2,
++	 {0xb9, 0x02, 0x00, 0xfc, 0x19, 0xba, 0x02, 0x00, 0x7c, 0x18, 0x0f, 0x44, 0xd1}},
+ };
+-bool gDoXor, gDoWf, gDoPc;
++bool gDoXor, gDoWf, gDoPc, gDoNoBin;
+ uint32_t gWfPatched;
+ 
+ mach_vm_address_t orgCsValidateRange;
+@@ -63,7 +71,7 @@ void writeRep(uint8_t *at, const char *how, size_t off) {
+ 
+ void patchWalkFence(uint8_t *p, size_t size) {
+ 	for (auto &w : wfPats) {
+-		if ((w.arg == 0 && !gDoWf) || (w.arg == 1 && !gDoPc) || size < w.len)
++		if ((w.arg == 0 && !gDoWf) || (w.arg == 1 && !gDoPc) || (w.arg == 2 && !gDoNoBin) || size < w.len)
+ 			continue;
+ 		for (size_t o = 0, end = size - w.len; o <= end; o++) {
+ 			if (p[o] != w.pat[0] || memcmp(p + o, w.pat, w.len))
+@@ -72,10 +80,14 @@ void patchWalkFence(uint8_t *p, size_t size) {
+ 				LOG("umd: no write access for walk fence patch");
+ 				return;
+ 			}
+-			p[o + w.off] = w.to;
++			if (w.arg == 2)
++				memcpy(p + o, w.rep, w.len);
++			else
++				p[o + w.off] = w.to;
+ 			MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+ 			if (++gWfPatched <= 8)
+-				LOG("umd: %s (%s, page off 0x%lx, #%u)", w.arg ? "HwInfo +0xac" : "PA_SC_MODE_CNTL_1 WALK_FENCE_SIZE 3 -> 2",
++				LOG("umd: %s (%s, page off 0x%lx, #%u)",
++				    w.arg == 2 ? "UpdatePrimBatchBinning" : w.arg ? "HwInfo +0xac" : "PA_SC_MODE_CNTL_1 WALK_FENCE_SIZE 3 -> 2",
+ 				    w.name, (unsigned long)o, gWfPatched);
+ 		}
+ 	}
+@@ -83,7 +95,7 @@ void patchWalkFence(uint8_t *p, size_t size) {
+ 
+ void patchPage(const void *data, size_t size) {
+ 	auto p = static_cast<uint8_t *>(const_cast<void *>(data));
+-	if (p && (gDoWf || gDoPc))
++	if (p && (gDoWf || gDoPc || gDoNoBin))
+ 		patchWalkFence(p, size);
+ 	if (!gDoXor || !p || size < sizeof(xorPat))
+ 		return;
+@@ -126,7 +138,8 @@ void umdRoute(KernelPatcher &patcher) {
+ 	gDoXor = !rmbProbe() && !checkKernelArgument("-rmbnoxor0");
+ 	gDoWf = checkKernelArgument("-rmbwalkfence2");  // patch 0030, also in probe stages
+ 	gDoPc = checkKernelArgument("-rmbpclines256");  // patch 0031
+-	if (!gDoXor && !gDoWf && !gDoPc)
++	gDoNoBin = checkKernelArgument("-rmbnobinning");  // patch 0032
++	if (!gDoXor && !gDoWf && !gDoPc && !gDoNoBin)
+ 		return;
+ 	KernelPatcher::RouteRequest req[] {
+ 		{"_cs_validate_page", wrapCsValidatePage, orgCsValidatePage},
+@@ -135,7 +148,7 @@ void umdRoute(KernelPatcher &patcher) {
+ 	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, req, arrsize(req)))
+ 		LOG("umd: failed to route cs_validate_page/range (err %d)", patcher.getError());
+ 	else
+-		LOG("umd: page patch installed (cs_validate_page + range): pipeBankXor 0 %s, walk fence 2 %s, pc lines 256 %s",
+-		    gDoXor ? "on" : "off", gDoWf ? "on" : "off", gDoPc ? "on" : "off");
++		LOG("umd: page patch installed (cs_validate_page + range): pipeBankXor 0 %s, walk fence 2 %s, pc lines 256 %s, binning off %s",
++		    gDoXor ? "on" : "off", gDoWf ? "on" : "off", gDoPc ? "on" : "off", gDoNoBin ? "on" : "off");
+ 	patcher.clearError();
+ }
+-- 
+2.39.5 (Apple Git-154)
+

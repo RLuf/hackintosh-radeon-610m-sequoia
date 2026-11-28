@@ -1,0 +1,70 @@
+From f0ef21f0464f7afaece5a4f80fa6bb11f1e0b7b6 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 08:10:07 -0800
+Subject: [PATCH 12/48] feat: instrumenta e aceita BOOTLOAD_COMPLETE em
+ _gc_check_ucode_loaded_10_1
+
+---
+ src/RembrandtGfx/firmware.cpp   |  2 +-
+ src/RembrandtGfx/kern_start.cpp | 25 ++++++++++++++++++++++++-
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index 7ade9d9..91867ee 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -192,7 +192,7 @@ uint64_t wrapCapCheck(uint64_t psp, uint64_t type, uint64_t c, uint64_t d, uint6
+ 	auto r = skipFwType(type & 0xFFFFFFFF) ? 0 : reinterpret_cast<Fn6>(orgCapCheck)(psp, type, c, d, e, f) & 0xFF;
+ 	if (r && (type & 0xFFFFFFFF) == 35)  // DMUB
+ 		dmubResetForLoad();
+-	if (rmbVerbose())
++	if (rmbVerbose() || rmbStage() == 3)
+ 		LOG("fw: np_fw_load type %llu -> %s", type & 0xFFFFFFFF, r ? "load" : "skip");
+ 	return r;
+ }
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index d1cb79e..7f8d526 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -764,7 +764,29 @@ static uint64_t wrap_ApplyClocksAdjustRules(uint64_t, uint64_t, uint64_t, uint64
+ 
+ // bgm hw init applies the device-capability golden table (Navi23's: GL2 match masks 0xffffffcf etc.)
+ // and vm_10_3_hw_init programs more GC registers; after each, put Rembrandt's golden values back.
+-static mach_vm_address_t org_execute_register_golden_settings, org_gc_10_3_initialize_registers;
++static mach_vm_address_t org_execute_register_golden_settings, org_gc_10_3_initialize_registers, org_gc_check_ucode_loaded_10_1;
++static uint64_t wrap_gc_check_ucode_loaded_10_1(uint64_t gc, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	auto g = reinterpret_cast<const uint8_t *>(gc);
++	uint32_t regStat = g ? *reinterpret_cast<const uint32_t *>(g + 0xb38) : 0;
++	uint32_t regBoot = g ? *reinterpret_cast<const uint32_t *>(g + 0xb3c) : 0;
++	uint32_t f322 = g ? g[0x322] : 0, f326 = g ? g[0x326] : 0, f329 = g ? g[0x329] : 0;
++	LOG("gc_check_ucode_loaded: enter flags 322=%u 326=%u 329=%u regStat=%x regBoot=%x; RLC_CNTL=%x RLC_STAT=%x BOOTLOAD=%x CP_STAT=%x GRBM=%x",
++	    f322, f326, f329, regStat, regBoot,
++	    mmioRead(0xA000 + 0x4c00), mmioRead(0xA000 + 0x4c04), mmioRead(0xA000 + 0x4e8d),
++	    mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4));
++	auto r = reinterpret_cast<Fn6>(org_gc_check_ucode_loaded_10_1)(gc, b, c, d, e, f);
++	uint32_t rlcCntl = mmioRead(0xA000 + 0x4c00), rlcStat = mmioRead(0xA000 + 0x4c04);
++	uint32_t bootload = mmioRead(0xA000 + 0x4e8d), cpStat = mmioRead(0x1260 + 0x0f40);
++	uint32_t grbm = mmioRead(0x1260 + 0x0da4);
++	LOG("gc_check_ucode_loaded: exit r=%llx; RLC_CNTL=%x RLC_STAT=%x BOOTLOAD=%x CP_STAT=%x GRBM=%x",
++	    r & 0xFFFFFFFF, rlcCntl, rlcStat, bootload, cpStat, grbm);
++	if ((r & 0xFFFFFFFF) != 0 && (bootload & 0x80000000u) != 0 && bootload != 0xFFFFFFFFu) {
++		LOG("gc_check_ucode_loaded: BOOTLOAD_COMPLETE=1 (bootload=%x rlc_stat=%x) -> returning 0 (Linux condition)",
++		    bootload, rlcStat);
++		return 0;
++	}
++	return r;
++}
+ static uint64_t wrap_execute_register_golden_settings(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	auto r = reinterpret_cast<Fn6>(org_execute_register_golden_settings)(a, b, c, d, e, f);
+ 	LOG("golden: after execute_register_golden_settings (%llx)", r);
+@@ -898,6 +920,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"_gc_get_config", wrap_gc_get_config, org_gc_get_config},
+ 		{"_execute_register_golden_settings", wrap_execute_register_golden_settings, org_execute_register_golden_settings},
+ 		{"_gc_10_3_initialize_registers", wrap_gc_10_3_initialize_registers, org_gc_10_3_initialize_registers},
++		{"_gc_check_ucode_loaded_10_1", wrap_gc_check_ucode_loaded_10_1, org_gc_check_ucode_loaded_10_1},
+ 		{"_gc_set_fw_entry_info", wrap_gc_set_fw_entry_info, org_gc_set_fw_entry_info},
+ 		{"_gc_init_fcn_ptr_list", wrap_gc_init_fcn_ptr_list, org_gc_init_fcn_ptr_list},
+ 		{"_gc_validate_hw_config_tbl_version", wrap_gc_validate_hw_config_tbl_version, org_gc_validate_hw_config_tbl_version},
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,142 @@
+From cbbf3c12b261eafd5eb303dc89125539a3342848 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 05:36:58 -0300
+Subject: [PATCH 38/48] -rmbwavedump: estado das ondas vivas (PC, STATUS,
+ contadores) na trava (0034)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ src/RembrandtGfx/probe.cpp      | 13 +++++++--
+ src/RembrandtGfx/rmb.hpp        |  2 ++
+ src/RembrandtGfx/vmwatch.cpp    | 52 +++++++++++++++++++++++++++++++++
+ 4 files changed, 66 insertions(+), 3 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 88dbc89..f9ebbf2 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0033, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0034, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/probe.cpp b/src/RembrandtGfx/probe.cpp
+index beb1c06..5760883 100644
+--- a/src/RembrandtGfx/probe.cpp
++++ b/src/RembrandtGfx/probe.cpp
+@@ -207,8 +207,12 @@ uint64_t wrapMemComplete(uint64_t self, uint64_t res, uint64_t c, uint64_t d, ui
+ uint64_t wrapResetHardware(uint64_t self, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	LOG("hw-reset: resetHardware(%llx)", b);
+ 	static uint32_t dumps;
+-	if (gCarveRead && dumps++ < 3)
+-		shaderDump("hang");
++	if ((gCarveRead || gWaveDump) && dumps++ < 3) {
++		if (gWaveDump)
++			waveDump("hang");  // first: before anything else touches the chip
++		if (gCarveRead)
++			shaderDump("hang");
++	}
+ 	auto r = reinterpret_cast<Fn6>(orgResetHardware)(self, b, c, d, e, f);
+ 	syncSdmaAddrConfig("after resetHardware");
+ 	return r;
+@@ -567,6 +571,8 @@ void route(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size
+ 
+ }  // namespace
+ 
++bool gWaveDump;  // patch 0034 (-rmbwavedump); global, outside the anonymous namespace (see 0025)
++
+ void probeRouteFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	KernelPatcher::RouteRequest reqs[] {
+ 		{"__ZN31AMDRadeonX6000_AmdAsicInfoNavi218populateMemorySizeEv", wrapPopulateMemorySize, orgPopulateMemorySize},
+@@ -1186,6 +1192,9 @@ void probeRouteAccel(KernelPatcher &patcher, size_t index, mach_vm_address_t add
+ 		{"__ZN35AMDRadeonX6000_AMDAtomicBlitManager8doExpandEP15_UBM_EXPANDINFOPK11ABM_OPTIONS", wrapUbmOp<&orgDoExpand, 'E'>, orgDoExpand},
+ 	};
+ 	route(patcher, index, address, size, reqs, arrsize(reqs));
++	gWaveDump = checkKernelArgument("-rmbwavedump");  // patch 0034: measurement only
++	if (gWaveDump)
++		LOG("wavedump: live wave state (SQ_IND_INDEX/DATA) logged at GPU hangs");
+ 	if (checkKernelArgument("-rmbhdpwatch")) {  // patch 0033: measurement only
+ 		gCarveRead = true;
+ 		KernelPatcher::RouteRequest hr[] {
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 13ca802..5e2c54c 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -188,6 +188,8 @@ void ptScan(const char *why);
+ void ptScanVmid(uint32_t vmid, bool quietIfSame = false);
+ uint64_t ptVmidBase(uint32_t vmid);
+ void shaderDump(const char *why);  // patch 0033: shader code at a hang, HDP flush remap
++void waveDump(const char *why);  // patch 0034: live wave state (PC, STATUS, counters) at a hang
++extern bool gWaveDump;  // -rmbwavedump
+ void mmhubDump(const char *why);  // 0 when the context is disabled
+ void gartCensus(const char *when);
+ // Save the GART at S3 entry; on wake put back PTEs that were valid then and are zero now.
+diff --git a/src/RembrandtGfx/vmwatch.cpp b/src/RembrandtGfx/vmwatch.cpp
+index 9fba2d4..486f875 100644
+--- a/src/RembrandtGfx/vmwatch.cpp
++++ b/src/RembrandtGfx/vmwatch.cpp
+@@ -629,3 +629,55 @@ void shaderDump(const char *why) {
+ 		}
+ 	}
+ }
++
++// Patch 0034 (-rmbwavedump), called at a GPU hang before Apple's reset: the state of every live wave,
++// as Linux gfx_v10_0_read_wave_data / amdgpu_debugfs_wave_read do. GRBM_GFX_INDEX (GC seg 1 0x2200 =
++// 0xC200) selects SE 0 / SA 0 / INSTANCE (gfx10: the SIMD is part of INSTANCE, gfx_v10_0.c:4434);
++// SQ_IND_INDEX/DATA (GC seg 0 0x1118/0x1119 = 0x2378/0x2379) read ixSQ_WAVE_* (gc_10_3_0_offset.h).
++// INSTANCE 0..7 x wave 0..15 are swept; HW_ID1 says which SIMD/WGP/wave was really read. Only waves with
++// STATUS.VALID (bit 16). Then the PC is walked in the wave's VMID (HW_ID2 bits 27:24) and 8 dwords around
++// it dumped. GRBM_GFX_INDEX goes back to broadcast (0xE0000000) at the end, as Linux does.
++void waveDump(const char *why) {
++	constexpr uint32_t GfxIndex = 0xA000 + 0x2200, IndIndex = 0x1260 + 0x1118, IndData = 0x1260 + 0x1119;
++	uint32_t before = mmioRead(GfxIndex), live = 0;
++	for (uint32_t inst = 0; inst < 8; inst++) {
++		mmioWrite(GfxIndex, inst);  // SE 0, SA 0, INSTANCE inst, no broadcast
++		for (uint32_t wave = 0; wave < 16; wave++) {
++			auto rd = [&](uint32_t ix) {
++				mmioWrite(IndIndex, wave | ix << 16);
++				return mmioRead(IndData);
++			};
++			uint32_t st = rd(0x102);
++			if (st == 0xFFFFFFFF || !(st & (1u << 16)))
++				continue;
++			uint32_t pcLo = rd(0x108), pcHi = rd(0x109), inst0 = rd(0x10a), ib = rd(0x107), ib2 = rd(0x11c);
++			uint32_t id1 = rd(0x117), id2 = rd(0x118), trap = rd(0x103), gpr = rd(0x105), m0 = rd(0x27c);
++			uint32_t exLo = rd(0x27e), exHi = rd(0x27f);
++			uint64_t pc = (uint64_t)(pcHi & 0xFFFF) << 32 | pcLo;
++			uint32_t vmid = (id2 >> 24) & 0xF;
++			if (++live > 32)
++				continue;
++			LOG("wave %s: inst %u wave %u (hw: se %u sa %u wgp %u simd %u wave %u; me %u pipe %u queue %u vmid %u) "
++				"STATUS %x [%s%s%s%s%s%s%s%s] PC %llx INST %08x EXEC %08x_%08x",
++				why, inst, wave, (id1 >> 18) & 3, (id1 >> 16) & 1, (id1 >> 10) & 0xF, (id1 >> 8) & 3, id1 & 0x1F,
++				(id2 >> 8) & 3, (id2 >> 4) & 3, id2 & 0xF, vmid, st, st & (1u << 13) ? "HALT " : "",
++				st & (1u << 14) ? "TRAP " : "", st & (1u << 12) ? "IN_BARRIER " : "", st & (1u << 8) ? "EXPORT_RDY " : "",
++				st & (1u << 27) ? "MUST_EXPORT " : "", st & (1u << 23) ? "FATAL_HALT " : "", st & (1u << 9) ? "EXECZ " : "",
++				st & (1u << 18) ? "SKIP_EXPORT" : "", pc, inst0, exHi, exLo);
++			LOG("wave %s: inst %u wave %u IB_STS %x (vm_cnt %u exp_cnt %u lgkm_cnt %u valu_cnt %u vs_cnt %u) IB_STS2 %x "
++				"TRAPSTS %x GPR_ALLOC %x M0 %x",
++				why, inst, wave, ib, (ib & 0xF) | ((ib >> 22) & 3) << 4, (ib >> 4) & 7,
++				((ib >> 8) & 0xF) | ((ib >> 7) & 1) << 4 | ((ib >> 24) & 1) << 5, (ib >> 12) & 7, (ib >> 26) & 0x3F, ib2, trap, gpr,
++				m0);
++			uint64_t at = pc >= 0x10 ? pc - 0x10 : pc;
++			uint32_t code[8];
++			if (vmid && readGpuVa(vmid, at & ~3ULL, code, 8))
++				LOG("wave %s: inst %u wave %u code at %llx: %08x %08x %08x %08x [%08x] %08x %08x %08x", why, inst, wave, at & ~3ULL,
++					code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
++			else
++				LOG("wave %s: inst %u wave %u code at %llx: not readable (vmid %u)", why, inst, wave, at & ~3ULL, vmid);
++		}
++	}
++	mmioWrite(GfxIndex, 0xE0000000);
++	LOG("wave %s: %u live waves (GRBM_GFX_INDEX was %x, back to broadcast)", why, live, before);
++}
+-- 
+2.39.5 (Apple Git-154)
+

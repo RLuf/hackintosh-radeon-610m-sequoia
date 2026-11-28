@@ -1,0 +1,145 @@
+From 2f74ca3778feafc61dd8311b2e29121c273bd833 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 06:09:15 +0000
+Subject: [PATCH] fix: seletor do GVM usa a linha mais proxima quando a versao
+ da Mendocino nao tem linha
+
+Com o 0008, bgm_create passa e o HWLibs para em ipi_gvm_sw_init:
+"NULL GVM sw_init entry!". gvm_sw_init chama mc, vm, hdp e athub, e cada
+um busca a versao do seu bloco numa tabela com _gvm_get_ip_function.
+No 15.8.1 a tabela do vm vai ate 10.3.5 (a GC da Mendocino e 10.3.7) e a
+do mc nao tem 6.0.1 nem 10.0.1. Sem linha, o bloco devolve erro.
+O gancho registra toda busca. Quando a versao exata nao tem linha, uma
+busca de inicializacao e repetida na mesma linha major.minor: 10.3.7 usa
+a 10.3.3 (a que a 680M usa), o resto usa a revisao 0. Buscas de saida
+ficam como o original respondeu.
+Depois de revisao independente: tabela vazia e respondida pelo gancho
+(o prologo do original tem um je curto), as rotas novas vao no fim da
+tabela, o log diz se os ganchos entraram e o retorno de gvm_sw_init e
+dos quatro blocos, e a entrada trocada do 0008 passa a morar em buffer
+proprio por gancho em vez da pilha.
+---
+ src/RembrandtGfx/kern_start.cpp | 77 ++++++++++++++++++++++++++++++---
+ 1 file changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 68627a7..ce068c2 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -560,13 +560,12 @@ static uint64_t wrap_pcie_ip_sw_init(uint64_t, uint64_t, uint64_t, uint64_t, uin
+ // MP0 below, only a copy of the 0x260-byte entry is changed; both functions copy the entry they are given.
+ // Entry: +0x8 major, +0xC minor, +0x10 revision.
+ static uint64_t presentIpVersion(const char *name, mach_vm_address_t org, uint64_t ctx, uint64_t info, uint64_t out,
+-	uint64_t d, uint64_t e, uint64_t f, uint32_t maj, uint32_t min, uint32_t rev, uint32_t asRev) {
+-	uint8_t copy[0x260];
++	uint64_t d, uint64_t e, uint64_t f, uint32_t maj, uint32_t min, uint32_t rev, uint32_t asRev, uint8_t *copy) {
+ 	if (info) {
+ 		auto ip = reinterpret_cast<const uint32_t *>(info);
+ 		uint32_t m = ip[2] & 0xFFFF, n = ip[3] & 0xFFFF, r = ip[4] & 0xFFFF;
+ 		if (m == maj && n == min && r == rev) {
+-			memcpy(copy, ip, sizeof(copy));
++			memcpy(copy, ip, 0x260);
+ 			reinterpret_cast<uint32_t *>(copy)[4] = (ip[4] & ~0xFFFFu) | asRev;
+ 			info = reinterpret_cast<uint64_t>(copy);
+ 			LOG("%s: %u.%u.%u, presenting as %u.%u.%u", name, m, n, r, m, n, asRev);
+@@ -579,13 +578,72 @@ static uint64_t presentIpVersion(const char *name, mach_vm_address_t org, uint64
+ 	return res;
+ }
+ static mach_vm_address_t org_pcie_ip_create, org_smuio_ip_create;
++// The changed entry lives in a buffer of its own per hook, not on the stack: if the callee keeps the pointer it
++// was given, the entry stays valid after the hook returns.
+ static uint64_t wrap_pcie_ip_create(uint64_t ctx, uint64_t info, uint64_t out, uint64_t d, uint64_t e, uint64_t f) {
+-	return presentIpVersion("pcie_ip_create", org_pcie_ip_create, ctx, info, out, d, e, f, 6, 0, 1, 0);
++	static uint8_t copy[0x260];
++	return presentIpVersion("pcie_ip_create", org_pcie_ip_create, ctx, info, out, d, e, f, 6, 0, 1, 0, copy);
+ }
+ static uint64_t wrap_smuio_ip_create(uint64_t ctx, uint64_t info, uint64_t out, uint64_t d, uint64_t e, uint64_t f) {
+-	return presentIpVersion("smuio_ip_create", org_smuio_ip_create, ctx, info, out, d, e, f, 13, 0, 9, 1);
++	static uint8_t copy[0x260];
++	return presentIpVersion("smuio_ip_create", org_smuio_ip_create, ctx, info, out, d, e, f, 13, 0, 9, 1, copy);
++}
++
++// GVM (the SWIP that owns VM and GART) runs four sub-blocks from gvm_sw_init: mc, vm, hdp and athub. Each
++// takes its block's version from the IP entries and asks
++//   _gvm_get_ip_function(major, minor, revision, which, table, rows)
++// for the function to run. Rows are 0x28 bytes: three 16-bit version fields, then sw_init, hw_init, sw_exit
++// and hw_exit (which = 0..3). No row means no function: the sub-block returns an error and ipi_gvm_sw_init
++// asserts "NULL GVM sw_init entry!" (seen on the 610M as soon as bgm_create started to pass; tables read from
++// SystemKernelExtensions.kc with kc-le.py tabs). In 15.8.1 the vm table stops at 10.3.5 while Mendocino's GC
++// is 10.3.7, and the mc table has neither 6.0.1 nor 10.0.1, the two versions Mendocino may hand it. The hdp
++// (5.2.0) and athub (2.4.0) rows exist.
++// When the exact version has no row, an init lookup (which 0 or 1) is retried inside the same major.minor
++// line: 10.3.7 takes the 10.3.3 row, the one the 680M uses natively; anything else takes revision 0, as
++// patch 0008 does for PCIE. Exit lookups (which 2 or 3) are left as the original answered: after a failed
++// init they would run on a half-built context. Every lookup is logged, so the log names the version each
++// sub-block really asked for.
++// Prologue note: the original starts push/mov/push/push, test r9d, je. A long (14-byte) route copies that
++// short je into the trampoline unrelocated, and it is taken only when rows is 0. The hook answers that
++// case itself (the original returns 0 for an empty table), so the copied jump is never taken.
++static mach_vm_address_t org_gvm_get_ip_function;
++static uint64_t wrap_gvm_get_ip_function(uint64_t maj, uint64_t min, uint64_t rev, uint64_t which, uint64_t table,
++	uint64_t rows) {
++	auto org = reinterpret_cast<Fn6>(org_gvm_get_ip_function);
++	uint32_t m = maj & 0xFFFF, n = min & 0xFFFF, r = rev & 0xFFFF;
++	uint32_t w = static_cast<uint32_t>(which), cnt = static_cast<uint32_t>(rows);
++	if (!cnt)
++		return 0;
++	auto fn = org(maj, min, rev, which, table, rows);
++	if (fn) {
++		LOG("gvm_get_ip_function: %u.%u.%u fn %u (table of %u rows): found", m, n, r, w, cnt);
++		return fn;
++	}
++	uint32_t as = (m == 10 && n == 3 && r == 7) ? 3 : 0;
++	if (w < 2 && as != r)
++		fn = org(maj, min, as, which, table, rows);
++	if (fn)
++		LOG("gvm_get_ip_function: %u.%u.%u fn %u (table of %u rows): no row, using %u.%u.%u", m, n, r, w, cnt, m, n, as);
++	else
++		LOG("gvm_get_ip_function: %u.%u.%u fn %u (table of %u rows): no row", m, n, r, w, cnt);
++	return fn;
+ }
+ 
++// Return code of gvm_sw_init and of each sub-block, so a failure after the lookup still names its block.
++// Their first 16 bytes are push/mov/push.../sub rsp (read with kc-le.py dis): safe to route.
++#define RESULT_HOOK(name)                                                                   \
++	static mach_vm_address_t org_##name;                                                     \
++	static uint64_t wrap_##name(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) { \
++		auto r = reinterpret_cast<Fn6>(org_##name)(a, b, c, d, e, f);                       \
++		LOG(#name " = %x", static_cast<uint32_t>(r));                                       \
++		return r;                                                                            \
++	}
++RESULT_HOOK(gvm_sw_init)
++RESULT_HOOK(mc_sw_init)
++RESULT_HOOK(vm_sw_init)
++RESULT_HOOK(hdp_sw_init)
++RESULT_HOOK(athub_sw_init)
++
+ // DeviceCapabilityTbl is keyed by (device id, internal revision, external/PCI revision). All
+ // Navi 23 (0x73FF) rows have internal revision 0; Rembrandt reports its own, so no row matches.
+ // Look up the Navi 23 row with internal revision 0 and the real PCI revision.
+@@ -918,6 +976,13 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"__ZN14AmdTtlServices13initializeGmmEv", wrap_TtlInitializeGmm, org_TtlInitializeGmm},
+ 		{"__ZN14AmdTtlServices13initializeIcmEv", wrap_TtlInitializeIcm, org_TtlInitializeIcm},
+ 		{"__ZN14AmdTtlServices13initializePrmEv", wrap_TtlInitializePrm, org_TtlInitializePrm},
++		// Added last so the routes tested before keep their place in the table.
++		{"_gvm_get_ip_function", wrap_gvm_get_ip_function, org_gvm_get_ip_function},
++		{"_gvm_sw_init", wrap_gvm_sw_init, org_gvm_sw_init},
++		{"_mc_sw_init", wrap_mc_sw_init, org_mc_sw_init},
++		{"_vm_sw_init", wrap_vm_sw_init, org_vm_sw_init},
++		{"_hdp_sw_init", wrap_hdp_sw_init, org_hdp_sw_init},
++		{"_athub_sw_init", wrap_athub_sw_init, org_athub_sw_init},
+ 	};
+ 	for (auto &r : requests) {
+ 		if ((s2 || s3) && stage2Skips(r.symbol, s3))
+@@ -926,6 +991,8 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 			LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
+ 		patcher.clearError();
+ 	}
++	LOG("gvm: selector hook %s, result hooks %d of 5", org_gvm_get_ip_function ? "installed" : "NOT installed",
++		!!org_gvm_sw_init + !!org_mc_sw_init + !!org_vm_sw_init + !!org_hdp_sw_init + !!org_athub_sw_init);
+ 	org_vbs_post = patcher.solveSymbol(index, "_vbs_post");
+ 	gSkipTasks[0] = patcher.solveSymbol(index, "_PEM_Task_EnableDynamicStateManagement");
+ 	patcher.clearError();
+-- 
+2.43.0
+

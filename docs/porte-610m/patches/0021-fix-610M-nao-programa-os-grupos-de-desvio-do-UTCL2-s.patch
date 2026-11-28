@@ -1,0 +1,125 @@
+From 87273e067ca1b322a86a163d0dfc8f499cae8834 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 19:14:46 -0800
+Subject: [PATCH 21/48] fix: 610M nao programa os grupos de desvio do UTCL2 (so
+ valem para GC 10.3.1/10.3.3)
+
+Medido no boot de 24/11 19:03 (kext patch 0020): com a tabela GART zerada pela
+CPU, o processador de comandos fica livre (CP_STAT 0, GRBM 3028) durante as 11
+cargas de firmware pelo PSP. No instante em que o AUTOLOAD_RLC roda, CP_STAT
+vira 80404000 (CP_BUSY | DMA_BUSY | UTCL2IU_BUSY) e nao sai mais; BOOTLOAD
+fica em 0. O sintoma e o mesmo do DMA da limpeza: o que passa pelo UTCL2 nao
+recebe resposta.
+
+Diferenca conhecida entre a 680M e a 610M nesse bloco: o kext apresenta o GC
+10.3.7 como 10.3.3, entao o HWLibs roda _vm_10_3_3_hw_init, que termina em
+_gc_10_3_1_initialize_utcl2_bypass_groups (le CC_GC_SA_UNIT_DISABLE |
+GC_USER_SA_UNIT_DISABLE, bits 9:8, e grava GCUTCL2_HARVEST_BYPASS_GROUPS).
+E o gfxhub_v2_1_utcl2_harvest do Linux, que so faz isso para GC 10.3.1 e
+10.3.3 (gfxhub_v2_1.c:544-582); para 10.3.7 nao programa nada.
+
+Correcao: na 610M o gancho nao deixa o HWLibs programar esses grupos.
+Chave: -rmbutcl2harvest devolve o comportamento da 680M.
+Medicao: s3Sample ganha uma terceira linha com o estado do UTCL2 / GCVM L2 e
+dos bits de colheita, em todos os marcos.
+
+Confirma: depois do AUTOLOAD_RLC, CP_STAT volta a 0 e BOOTLOAD ganha o bit 31
+("late wait" com tempos, ou "exit r=0").
+Refuta: a linha "HWLibs would write 0" (a escrita ja era nula), ou CP_STAT
+80404000 de novo com os grupos intocados.
+Para: panico, perda de SSH, RESTORE MISMATCH ou "failed to route".
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSo88Xro5AsvDqwXSnr
+---
+ src/RembrandtGfx/kern_start.cpp | 43 ++++++++++++++++++++++++++++++---
+ 1 file changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 9faa92f..639c629 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -773,6 +773,12 @@ static void s3Sample(const char *when) {
+ 	    mmioRead(G0 + 0x1702), mmioRead(G0 + 0x15fc), mmioRead(G0 + 0x1668), mmioRead(G0 + 0x1667),
+ 	    mmioRead(G0 + 0x1688), mmioRead(G0 + 0x1687), mmioRead(G0 + 0x16a8), mmioRead(G0 + 0x16a7),
+ 	    mmioRead(G0 + 0x15c8), mmioRead(G0 + 0x15ca), mmioRead(G0 + 0x15c9));
++	// Address translation (UTCL2 / GCVM L2) and shader-array harvest state (patch 0021).
++	LOG("s3 %s: UTCL2_HARVEST_BYPASS yc(16f8) %x gen(16fa) %x CC_SA_DIS %x USER_SA_DIS %x L2_CNTL %x %x %x %x L2_STATUS %x L1_TLB %x FAULT_CNTL %x GB_ADDR %x CC_SH_ARRAY %x USER_SH_ARRAY %x RLC_SAFE %x",
++	    when, mmioRead(G0 + 0x16f8), mmioRead(G0 + 0x16fa), mmioRead(G0 + 0x0fe9), mmioRead(G0 + 0x0fea),
++	    mmioRead(G0 + 0x15bc), mmioRead(G0 + 0x15bd), mmioRead(G0 + 0x15be), mmioRead(G0 + 0x15d4),
++	    mmioRead(G0 + 0x15bf), mmioRead(G0 + 0x1703), mmioRead(G0 + 0x15c4), mmioRead(G0 + 0x13de),
++	    mmioRead(G0 + 0x100f), mmioRead(G0 + 0x1010), mmioRead(G1 + 0x4ca0));
+ }
+ 
+ static mach_vm_address_t org_get_uma_physical_fb_offset;
+@@ -968,11 +974,12 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0020, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s",
++	LOG("stage 3: kext patch 0021, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+-	    checkKernelArgument("-rmbgpuclean") ? "by GPU DMA (-rmbgpuclean)" : "by CPU");
++	    checkKernelArgument("-rmbgpuclean") ? "by GPU DMA (-rmbgpuclean)" : "by CPU",
++	    checkKernelArgument("-rmbutcl2harvest") ? "programmed (-rmbutcl2harvest)" : "not programmed");
+ 	smuStage3BeforeHwInit();
+ 	s3Sample("before ttl_hw_init");
+ 	LOG(">> ttl_hw_init(%llx, %llx)", a, b);
+@@ -1114,6 +1121,34 @@ static uint64_t wrap_vm_clean_primary_page_table(uint64_t vm, uint64_t b, uint64
+ 	return r;
+ }
+ 
++// (e) patch 0021. The kext presents GC 10.3.7 to HWLibs as 10.3.3, so HWLibs runs
++// _vm_10_3_3_hw_init, whose last step is _gc_10_3_1_initialize_utcl2_bypass_groups: it reads the
++// shader-array disable bits (CC_GC_SA_UNIT_DISABLE | GC_USER_SA_UNIT_DISABLE, bits 9:8), turns each
++// disabled array into a pair of bits and writes GCUTCL2_HARVEST_BYPASS_GROUPS. That is Linux's
++// gfxhub_v2_1_utcl2_harvest, which does it ONLY for GC 10.3.1 and 10.3.3 (gfxhub_v2_1.c:544-582);
++// for 10.3.7 it programs nothing. Measured on the 610M (boot of 24/11 19:03, patch 0020): with the
++// GART clean no longer using CP DMA the command processor stays idle through all 11 LOAD_IP_FW,
++// and the moment AUTOLOAD_RLC runs CP_STAT becomes 80404000 with UTCL2IU_BUSY again: whatever goes
++// through the UTCL2 never gets an answer. Do what Linux does for this chip: leave the bypass
++// groups alone. -rmbutcl2harvest: let HWLibs program them as for the 680M.
++static mach_vm_address_t org_gc_10_3_1_initialize_utcl2_bypass_groups;
++static uint64_t wrap_gc_10_3_1_initialize_utcl2_bypass_groups(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	constexpr uint32_t G0 = 0x1260;
++	bool can = mmioAvailable();
++	uint32_t efuse = can ? mmioRead(G0 + 0x0fe9) : 0, user = can ? mmioRead(G0 + 0x0fea) : 0;
++	uint32_t yc = can ? mmioRead(G0 + 0x16f8) : 0, gen = can ? mmioRead(G0 + 0x16fa) : 0;
++	uint32_t dis = ((efuse | user) >> 8) & 3, want = (dis & 1 ? 3u : 0u) | (dis & 2 ? 0xcu : 0u);
++	if (gcHwVersion() == 0xa0307 && !checkKernelArgument("-rmbutcl2harvest")) {
++		LOG("gc: 610M: UTCL2 harvest bypass groups NOT programmed (Linux does it only for GC 10.3.1/10.3.3); CC_SA_DIS %x USER_SA_DIS %x -> HWLibs would write %x; register now yc(16f8) %x gen(16fa) %x",
++		    efuse, user, want, yc, gen);
++		return 0;
++	}
++	auto r = reinterpret_cast<Fn6>(org_gc_10_3_1_initialize_utcl2_bypass_groups)(a, b, c, d, e, f);
++	LOG("gc: utcl2 bypass groups programmed by HWLibs: CC_SA_DIS %x USER_SA_DIS %x (expected value %x); yc(16f8) %x -> %x, gen(16fa) %x -> %x",
++	    efuse, user, want, yc, can ? mmioRead(G0 + 0x16f8) : 0, gen, can ? mmioRead(G0 + 0x16fa) : 0);
++	return r;
++}
++
+ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	bool s2 = rmbStage() == 2, s3 = rmbStage() == 3;
+ 	KernelPatcher::RouteRequest requests[] {
+@@ -1206,6 +1241,8 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 			{"_gc_check_grbm_cam_remap_10_3", wrap_gc_check_grbm_cam_remap_10_3, org_gc_check_grbm_cam_remap_10_3},
+ 			{"_gc_golden_settings_execution", wrap_gc_golden_settings_execution, org_gc_golden_settings_execution},
+ 			{"_vm_clean_primary_page_table", wrap_vm_clean_primary_page_table, org_vm_clean_primary_page_table},
++			{"_gc_10_3_1_initialize_utcl2_bypass_groups", wrap_gc_10_3_1_initialize_utcl2_bypass_groups,
++			 org_gc_10_3_1_initialize_utcl2_bypass_groups},
+ 		};
+ 		unsigned routed = 0;
+ 		for (auto &r : diag) {
+@@ -1215,7 +1252,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 				LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
+ 			patcher.clearError();
+ 		}
+-		LOG("stage 3: %u of 8 stage-3 hooks installed (3 measurement, 5 fixes: asd load, asd unload, cam, golden, gart clean)", routed);
++		LOG("stage 3: %u of 9 stage-3 hooks installed (3 measurement, 6 fixes: asd load, asd unload, cam, golden, gart clean, utcl2 harvest)", routed);
+ 		LOG("stage 3: ttl_hw_init runs only if the preflight passes; wake POST hooks not installed");
+ 	}
+ 	LOG("HWLibs hooks installed");
+-- 
+2.39.5 (Apple Git-154)
+

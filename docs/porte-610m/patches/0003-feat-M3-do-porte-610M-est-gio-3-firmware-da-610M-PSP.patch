@@ -1,0 +1,1178 @@
+From bbae09516f76a8c0984db505c526ee8ac3e9c2d4 Mon Sep 17 00:00:00 2001
+From: fzmac porte <noreply@example.invalid>
+Date: Thu, 19 Nov 2026 21:15:12 +0000
+Subject: [PATCH 03/48] =?UTF-8?q?feat:=20M3=20do=20porte=20610M=20-=20est?=
+ =?UTF-8?q?=C3=A1gio=203:=20firmware=20da=20610M,=20PSP=20e=20GC,=20sem=20?=
+ =?UTF-8?q?tela?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Marco M3 do mapa de porte (docs/PORTING-MAP-610m.md do fzmacscript):
+PSP, carga de firmware e GC no ar, ainda sem framebuffer da AMD e sem
+tocar no motor de tela.
+
+rmbstage=3 (rmb.hpp). Os estágios 1 e 2 não mudam de comportamento.
+- É o estágio 2 mais: ganchos de firmware (TOC e 11 descritores de
+  microcódigo do GC), os ganchos do acelerador, o patch de leitura do
+  ponteiro do IH no framebuffer, e a inicialização de hardware liberada.
+- Checagem prévia na entrada de ttl_hw_init (kern_start.cpp): 12
+  condições que o M2 deveria ter estabelecido, conferidas NESTE boot
+  (identidade PCI vista, abertura de registros mapeada, linha de
+  capacidades, tipo do PSP, GC a0307, resposta do PMFW, tabela de
+  descoberta com GC 10.3.7 em 0x1260/0xA000, MP0/MP1 13.0.8 em 0x16000 e
+  SDMA0 5.2.7 em 0x1260, conjunto de firmware mendocino com todos os
+  ganchos, framebuffer sem tela com os 6 ganchos de descarte). Uma falha
+  e ttl_hw_init é bloqueado como no estágio 2. Até a checagem passar,
+  todas as regras de escrita são as do estágio 2.
+- Depois de passar: mmioWrite aceita GC/SDMA0 (segmentos 0x1260 e
+  0xA000), C2PMSG_64 do PSP e a caixa do PMFW; nada do motor de tela.
+  Mensagens ao PMFW: GetSmuVersion, DisallowGfxOff e, só com -rmbmode2,
+  o reset MODE2 (não é enviado por padrão, nem no boot nem no restart).
+- -rmbpsponly: deixa o psp_hw_init da Apple rodar e devolve falha a
+  quem chamou, para parar antes do GC; as escritas voltam a ser as do
+  estágio 2.
+- Sem tela: o tipo de firmware 35 (DMUB) é pulado, a imagem do DMUB não
+  é enfileirada, o poller do DMUB não é iniciado, as escritas do
+  framebuffer continuam descartadas; sem suporte a sono (mensagens de
+  sono ignoradas, ganchos de POST ao acordar e de psp_power_down_event
+  fora).
+
+Firmware (S14/S15): scripts/fw-extract.py ganha conjuntos (--set
+mendocino: gc_10_3_7_{me,pfp,ce,mec,mec2,rlc}, sdma_5_2_7,
+psp_13_0_8_toc, dcn_3_1_6_dmcub; yellow_carp continua), --list, erro
+claro para arquivo ausente ou truncado e um manifest.txt com conjunto e
+versões, embutido no kext (fw.s) e registrado no log. Makefile: FWSET
+(padrão mendocino), lista de arquivos vinda do script, a construção
+para se faltar arquivo e fw/ só é trocado com a extração completa.
+Símbolos fw_yc_* viram fw_apu_*.
+
+Golden settings (S34/S35): tabela do GC 10.3.7 copiada de
+gfx_v10_0.c:3614-3637 do Linux v6.12; a tabela e a máscara vigiada são
+escolhidas pela versão do GC que o HWLibs leu (a0303 ou a0307).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSn5SmsfPKALaTRZ7W5
+---
+ README.md                       |   4 +-
+ scripts/fw-extract.py           |  85 +++++++++++++++++------
+ src/RembrandtGfx/Makefile       |  24 +++++--
+ src/RembrandtGfx/display.cpp    |  18 ++---
+ src/RembrandtGfx/firmware.cpp   |  70 ++++++++++++++-----
+ src/RembrandtGfx/fw.hpp         |   8 ++-
+ src/RembrandtGfx/fw.s           |  93 +++++++++++++------------
+ src/RembrandtGfx/golden.cpp     |  66 ++++++++++++++++--
+ src/RembrandtGfx/ipdisc.cpp     |  32 ++++++++-
+ src/RembrandtGfx/kern_start.cpp | 118 +++++++++++++++++++++++++++-----
+ src/RembrandtGfx/mmio.cpp       |  16 ++++-
+ src/RembrandtGfx/rmb.hpp        |  15 +++-
+ src/RembrandtGfx/smu.cpp        |  47 +++++++++++--
+ 13 files changed, 463 insertions(+), 133 deletions(-)
+
+diff --git a/README.md b/README.md
+index 0c2c759..84cea68 100644
+--- a/README.md
++++ b/README.md
+@@ -88,7 +88,9 @@ Everything builds on Linux with clang:
+ 
+ ```sh
+ cd src/RembrandtGfx
+-make            # also splits /usr/lib/firmware/amdgpu/yellow_carp_*.bin into fw/ (FWSRC=... to override)
++make            # also splits the firmware in /usr/lib/firmware/amdgpu into fw/ (FWSRC=... to override);
++                # FWSET=mendocino (610M, default in this port: gc_10_3_7_*, sdma_5_2_7, psp_13_0_8_toc,
++                # dcn_3_1_6_dmcub) or FWSET=yellow_carp (680M). A missing file stops the build.
+ make install    # copies RembrandtGfx.kext into efi/EFI/OC/Kexts
+ ```
+ 
+diff --git a/scripts/fw-extract.py b/scripts/fw-extract.py
+index 8573f6c..019bd7d 100644
+--- a/scripts/fw-extract.py
++++ b/scripts/fw-extract.py
+@@ -1,13 +1,26 @@
+ #!/usr/bin/env python3
+-"""Split Rembrandt (yellow_carp) amdgpu firmware into the pieces HWLibs' GC firmware slots hold.
++"""Split an APU's amdgpu firmware into the pieces HWLibs' GC firmware slots hold.
+ 
+-  fw-extract.py FW-DIR OUT-DIR
++  fw-extract.py [--set NAME] FW-DIR OUT-DIR
++  fw-extract.py [--set NAME] --list          (file names the set needs, one per line)
+ 
+-FW-DIR holds decompressed /usr/lib/firmware/amdgpu/yellow_carp_*.bin. Header layouts follow
+-Linux amdgpu_ucode.h (MIT); payload selection follows amdgpu_ucode_init_single_fw for PSP
+-(front-door) loading. Writes OUT-DIR/<slot>.bin and prints a table.
++Sets (file names as Linux requests them):
++  yellow_carp  Rembrandt, Radeon 680M: yellow_carp_{me,pfp,ce,mec,mec2,rlc,sdma,toc,dmcub}.bin  (default)
++  mendocino    Mendocino, Radeon 610M: gc_10_3_7_{me,pfp,ce,mec,mec2,rlc}.bin (gfx_v10_0.c MODULE_FIRMWARE),
++               sdma_5_2_7.bin (sdma_v5_2.c), psp_13_0_8_toc.bin (psp_v13_0.c), dcn_3_1_6_dmcub.bin (amdgpu_dm.c)
++
++FW-DIR holds the decompressed files. Header layouts follow Linux amdgpu_ucode.h (MIT); payload
++selection follows amdgpu_ucode_init_single_fw for PSP (front-door) loading. Writes OUT-DIR/<slot>.bin
++and OUT-DIR/manifest.txt (set name, ucode version/feature version and size of each file; the kext
++logs it and refuses a set that does not match the chip), and prints a table. A missing file is an error.
+ """
+-import os, struct, sys
++import argparse, os, struct, sys
++
++SETS = {
++    'yellow_carp': dict({n: f'yellow_carp_{n}.bin' for n in ('me', 'pfp', 'ce', 'mec', 'mec2', 'rlc', 'sdma', 'toc', 'dmcub')}),
++    'mendocino': dict({n: f'gc_10_3_7_{n}.bin' for n in ('me', 'pfp', 'ce', 'mec', 'mec2', 'rlc')},
++                      sdma='sdma_5_2_7.bin', toc='psp_13_0_8_toc.bin', dmcub='dcn_3_1_6_dmcub.bin'),
++}
+ 
+ def common(b):
+     k = ('size_bytes header_size_bytes hdr_major hdr_minor ip_major ip_minor ucode_version '
+@@ -18,13 +31,38 @@ def u32s(b, off, n):
+     return struct.unpack_from(f'<{n}I', b, off)
+ 
+ def main():
+-    src, out = sys.argv[1], sys.argv[2]
++    ap = argparse.ArgumentParser()
++    ap.add_argument('--set', default='yellow_carp', choices=sorted(SETS))
++    ap.add_argument('--list', action='store_true')
++    ap.add_argument('dirs', nargs='*')
++    a = ap.parse_args()
++    files = SETS[a.set]
++    if a.list:
++        print('\n'.join(files.values()))
++        return
++    if len(a.dirs) != 2:
++        ap.error('FW-DIR and OUT-DIR are required')
++    src, out = a.dirs
++    missing = [f for f in files.values() if not os.path.isfile(os.path.join(src, f))]
++    if missing:
++        sys.exit(f'fw-extract: set {a.set}: missing in {src}: ' + ' '.join(missing))
+     os.makedirs(out, exist_ok=True)
+     pieces = {}
++    manifest = [f'set={a.set}']
+ 
+-    def gfx(name, file, with_jt=False):
+-        b = open(os.path.join(src, file), 'rb').read()
++    def load(slot):
++        b = open(os.path.join(src, files[slot]), 'rb').read()
+         h = common(b)
++        if h['size_bytes'] != len(b) or h['ucode_array_offset_bytes'] + h['ucode_size_bytes'] > len(b):
++            sys.exit(f'fw-extract: {files[slot]}: header does not match the file size ({len(b)} bytes)')
++        return b, h
++
++    def note(slot, h, feature=None):
++        manifest.append(f"{slot}={files[slot]}:{h['ucode_version']:#x}" + (f'/{feature}' if feature is not None else '')
++                        + f":{h['size_bytes']:#x}")
++
++    def gfx(name, with_jt=False):
++        b, h = load(name)
+         feat, jt_off, jt_size = u32s(b, 32, 3)
+         start, size = h['ucode_array_offset_bytes'], h['ucode_size_bytes']
+         if with_jt:
+@@ -32,16 +70,17 @@ def main():
+             pieces[name + '_jt'] = b[start + jt_off * 4:start + jt_off * 4 + jt_size * 4]
+         else:
+             pieces[name] = b[start:start + size]
++        note(name, h, feat)
+         return h
+ 
+     for n in ('me', 'pfp', 'ce'):
+-        gfx(n, f'yellow_carp_{n}.bin')
+-    gfx('mec', 'yellow_carp_mec.bin', with_jt=True)
+-    gfx('mec2', 'yellow_carp_mec2.bin', with_jt=True)
++        gfx(n)
++    gfx('mec', with_jt=True)
++    gfx('mec2', with_jt=True)
+ 
+-    b = open(os.path.join(src, 'yellow_carp_rlc.bin'), 'rb').read()
+-    h = common(b)
++    b, h = load('rlc')
+     print(f"rlc header v{h['hdr_major']}.{h['hdr_minor']}")
++    note('rlc', h, u32s(b, 32, 1)[0])
+     start, size = h['ucode_array_offset_bytes'], h['ucode_size_bytes']
+     pieces['rlc'] = b[start:start + size]
+     v20 = 32 + 4 * 18                                      # end of rlc_firmware_header_v2_0
+@@ -55,26 +94,32 @@ def main():
+         pieces['rlc_iram'] = b[f[1]:f[1] + f[0]]
+         pieces['rlc_dram'] = b[f[3]:f[3] + f[2]]
+ 
+-    b = open(os.path.join(src, 'yellow_carp_sdma.bin'), 'rb').read()
+-    h = common(b)
++    b, h = load('sdma')
++    note('sdma', h, u32s(b, 32, 1)[0])
+     pieces['sdma'] = b[h['ucode_array_offset_bytes']:h['ucode_array_offset_bytes'] + h['ucode_size_bytes']]
+ 
+     # PSP TOC (psp_firmware_header_v1_0): payload as in Linux psp_init_toc_microcode.
+-    b = open(os.path.join(src, 'yellow_carp_toc.bin'), 'rb').read()
+-    h = common(b)
++    b, h = load('toc')
++    note('toc', h)
+     pieces['toc'] = b[h['ucode_array_offset_bytes']:h['ucode_array_offset_bytes'] + h['ucode_size_bytes']]
+ 
+     # DMCUB (dmcub_firmware_header_v1_0: inst_const_bytes, bss_data_bytes after the common header):
+     # the PSP-signed inst_const image, as Linux hands it to the PSP for AMDGPU_UCODE_ID_DMCUB.
+-    b = open(os.path.join(src, 'yellow_carp_dmcub.bin'), 'rb').read()
+-    h = common(b)
++    b, h = load('dmcub')
++    note('dmcub', h)
+     inst_const, bss = u32s(b, 32, 2)
+     pieces['dmcub'] = b[h['ucode_array_offset_bytes']:h['ucode_array_offset_bytes'] + inst_const]
+     print(f"dmcub v{h['ucode_version']:#x} inst_const {inst_const:#x} bss {bss:#x}")
+ 
++    need = ('me pfp ce mec mec_jt rlc srlist_cntl srlist_gpm srlist_srm rlc_iram rlc_dram sdma toc dmcub').split()
++    empty = [n for n in need if not pieces.get(n)]
++    if empty:
++        sys.exit(f'fw-extract: set {a.set}: empty or absent pieces: ' + ' '.join(empty))
+     for n, data in pieces.items():
+         open(os.path.join(out, n + '.bin'), 'wb').write(data)
+         print(f'{n:12s} {len(data):#8x}')
++    open(os.path.join(out, 'manifest.txt'), 'w').write(' '.join(manifest))
++    print(' '.join(manifest))
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/src/RembrandtGfx/Makefile b/src/RembrandtGfx/Makefile
+index 6d8e563..e7e781b 100644
+--- a/src/RembrandtGfx/Makefile
++++ b/src/RembrandtGfx/Makefile
+@@ -20,13 +20,23 @@ all: $(KEXT)/MacOS/$(NAME)
+ 	clang++ $(CXXFLAGS) -c $< -o $@
+ plugin_start.o: $(LILU)/Library/plugin_start.cpp
+ 	clang++ $(CXXFLAGS) -c $< -o $@
+-# GC/SDMA/DMUB firmware pieces, split from linux-firmware's yellow_carp_*.bin (not shipped in this repo).
++# GC/SDMA/PSP TOC/DMUB firmware pieces, split from linux-firmware (not shipped in this repo).
++# FWSET picks the chip: mendocino (Radeon 610M, this port) or yellow_carp (Radeon 680M); the file
++# names come from scripts/fw-extract.py --list. A file that is missing (as .bin, .bin.zst or .bin.xz)
++# stops the build, and fw/ is replaced only once every piece was extracted. `make clean` after
++# changing FWSET or FWSRC.
+ FWSRC  ?= /usr/lib/firmware/amdgpu
+-fw/toc.bin:
+-	rm -rf fw.tmp && mkdir -p fw.tmp
+-	for f in $(FWSRC)/yellow_carp_*.bin*; do b=$$(basename $$f); case $$f in \
+-	  *.zst) zstd -qdcf $$f > fw.tmp/$${b%.zst} ;; *.xz) xz -dc $$f > fw.tmp/$${b%.xz} ;; *) cp $$f fw.tmp/ ;; esac; done
+-	python3 $(ROOT)/scripts/fw-extract.py fw.tmp fw && rm -rf fw.tmp
++FWSET  ?= mendocino
++FWEXTRACT := python3 $(ROOT)/scripts/fw-extract.py --set $(FWSET)
++fw/toc.bin: $(ROOT)/scripts/fw-extract.py
++	@set -e; rm -rf fw fw.tmp fw.new; mkdir -p fw.tmp; \
++	for b in $$($(FWEXTRACT) --list); do \
++	  if [ -f "$(FWSRC)/$$b" ]; then cp "$(FWSRC)/$$b" fw.tmp/$$b; \
++	  elif [ -f "$(FWSRC)/$$b.zst" ]; then zstd -qdcf "$(FWSRC)/$$b.zst" > fw.tmp/$$b; \
++	  elif [ -f "$(FWSRC)/$$b.xz" ]; then xz -dc "$(FWSRC)/$$b.xz" > fw.tmp/$$b; \
++	  else echo "*** RembrandtGfx: firmware $$b (or .zst/.xz) not found in $(FWSRC) (FWSET=$(FWSET)). Set FWSRC=<dir>." >&2; exit 1; fi; \
++	done; \
++	$(FWEXTRACT) fw.tmp fw.new; rm -rf fw.tmp; mv fw.new fw
+ fw.o: fw.s fw/toc.bin
+ 	clang -target x86_64-apple-macos10.15 -c $< -o $@
+ info.o: info.c
+@@ -48,6 +58,6 @@ install: all check
+ 	rm -rf $(ROOT)/efi/EFI/OC/Kexts/$(NAME).kext && cp -r $(NAME).kext $(ROOT)/efi/EFI/OC/Kexts/
+ 
+ clean:
+-	rm -rf *.o $(NAME) $(NAME).kext fw fw.tmp
++	rm -rf *.o $(NAME) $(NAME).kext fw fw.tmp fw.new
+ 
+ .PHONY: all check install clean
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 5a60ed9..757453f 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -1558,15 +1558,16 @@ void checkDmubStall() {
+ 				LOG("stall:   phy %x = %x", r, mmioRead(r));
+ }
+ 
+-// Stage 2 (rmbstage=2): Apple's framebuffer may read registers (remapped and PHY-hole-guarded as
+-// always), but nothing it writes through these hooks reaches the hardware: DAL writes, raw
+-// AmdRegisterAccess writes and VBIOS command tables are dropped and counted here.
++// Stages 2 and 3 (rmbstage=2, 3): Apple's framebuffer may read registers (remapped and
++// PHY-hole-guarded as always), but nothing it writes through these hooks reaches the hardware: DAL
++// writes, raw AmdRegisterAccess writes and VBIOS command tables are dropped and counted here.
+ bool stage2Dropped(const char *what, uint32_t a, uint32_t b) {
+-	if (rmbStage() != 2)
++	uint32_t stage = rmbStage();
++	if (stage != 2 && stage != 3)
+ 		return false;
+ 	static uint32_t n;
+ 	if (n++ < 40 || n % 1000 == 0)
+-		LOG("stage 2: dropped %s %x = %x (#%u)", what, a, b, n);
++		LOG("stage %u: dropped %s %x = %x (#%u)", stage, what, a, b, n);
+ 	return true;
+ }
+ 
+@@ -3189,7 +3190,7 @@ bool rmbVerbose() {
+ 	return on;
+ }
+ 
+-// Stage 2: only the register access hooks, and they drop every write (stage2Dropped). No watchdog
++// Stages 2 and 3: only the register access hooks, and they drop every write (stage2Dropped). No watchdog
+ // or poller thread, no early open, no backlight or presenter hook. Write hooks first; false unless
+ // all six are in place, and then the caller must not let the controller start.
+ bool displayRouteStage2(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+@@ -3207,10 +3208,11 @@ bool displayRouteStage2(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 		if (patcher.routeMultiple(index, &r, 1, address, size))
+ 			routed++;
+ 		else
+-			LOG("stage 2: failed to route %s (err %d)", r.symbol, static_cast<int>(patcher.getError()));
++			LOG("stage %u: failed to route %s (err %d)", rmbStage(), r.symbol, static_cast<int>(patcher.getError()));
+ 		patcher.clearError();
+ 	}
+-	LOG("stage 2: %zu of %zu framebuffer register hooks installed; writes and ATOM tables are dropped", routed, arrsize(reqs));
++	LOG("stage %u: %zu of %zu framebuffer register hooks installed; writes and ATOM tables are dropped", rmbStage(), routed,
++	    arrsize(reqs));
+ 	return routed == arrsize(reqs);
+ }
+ 
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index 8f44a70..9db1dc3 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -1,7 +1,9 @@
+ //
+ //  GC firmware substitution. HWLibs embeds Navi 23's signed GC microcode and hands it to the PSP,
+ //  which rejects it on Rembrandt (status 0x8000030a). Point HWLibs' firmware descriptors at the
+-//  Rembrandt images instead. Descriptor layout (0x38 bytes): +0x0C u32 size, +0x20 data pointer.
++//  APU's images instead (fw.s: the set built in, Rembrandt's yellow_carp_* or Mendocino's
++//  gc_10_3_7_* / psp_13_0_8_toc / sdma_5_2_7 / dcn_3_1_6_dmcub). Descriptor layout (0x38 bytes):
++//  +0x0C u32 size, +0x20 data pointer.
+ //
+ 
+ #include "rmb.hpp"
+@@ -48,10 +50,21 @@ void pspTeardownSeq(uint64_t p, const char *tag) {
+ 	}
+ }
+ IOReturn powerHandler(void *, void *, UInt32 type, IOService *, void *arg, vm_size_t) {
++	// Stage 3: headless and no sleep support. Only the shutdown / restart steps below run, without
++	// the panel power-off; sleep and wake messages are ignored (disable sleep for the test).
++	bool s3 = rmbStage() == 3;
++	if (s3 && type != kIOMessageSystemWillPowerOff && type != kIOMessageSystemWillRestart) {
++		static bool logged;
++		if (sleepEntering(type, arg) && !logged)
++			logged = true, LOG("stage 3: system sleep is not supported, nothing done for it");
++		return kIOReturnSuccess;
++	}
+ 	if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) {
+ 		LOG("shutdown: %s received", type == kIOMessageSystemWillPowerOff ? "WillPowerOff" : "WillRestart");
+-		edpAllowPowerOff("shutdown");
+-		edpPowerOffNow("shutdown");
++		if (!s3) {
++			edpAllowPowerOff("shutdown");
++			edpPowerOffNow("shutdown");
++		}
+ 	}
+ 	else if (sleepEntering(type, arg)) {
+ 		if (type != kIOMessageSystemWillSleep)
+@@ -106,7 +119,7 @@ IOReturn powerHandler(void *, void *, UInt32 type, IOService *, void *arg, vm_si
+ uint64_t wrapPspTmrInit(uint64_t psp, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	auto p = reinterpret_cast<uint8_t *>(psp);
+ 	LOG("fw: TOC %#x bytes -> %#x", *reinterpret_cast<uint32_t *>(p + 0x3580), FW_SIZE(toc));
+-	*reinterpret_cast<const uint8_t **>(p + 0x3588) = fw_yc_toc;
++	*reinterpret_cast<const uint8_t **>(p + 0x3588) = fw_apu_toc;
+ 	*reinterpret_cast<uint32_t *>(p + 0x3580) = FW_SIZE(toc);
+ 	auto r = reinterpret_cast<Fn6>(orgPspTmrInit)(psp, b, c, d, e, f);
+ 	LOG("fw: psp_tmr_init = %llx, TMR size %#llx", r & 0xFFFFFFFF, *reinterpret_cast<uint64_t *>(p + 0xaf8));
+@@ -167,6 +180,8 @@ bool skipFwType(uint32_t type) {
+ 		case 31:  // SE0 tap delays
+ 		case 32:  // SE1 tap delays
+ 			return true;
++		case 35:  // DMUB. Stage 3 is headless: the DMCUB the firmware started drives the panel, so it
++			return rmbStage() == 3;  // is neither stopped (dmubResetForLoad below) nor reloaded
+ 		default:
+ 			return false;
+ 	}
+@@ -192,27 +207,41 @@ uint64_t wrapDcn31FwConstraint(uint64_t ver, uint64_t dmcub, uint64_t list, uint
+ 	uint64_t ok = 0;
+ 	if (gDmcubLoadFw)
+ 		ok = reinterpret_cast<Fn6>(gDmcubLoadFw)(dmcub, reinterpret_cast<uint64_t>("atidmcub_0.dat"),
+-			reinterpret_cast<uint64_t>(fw_yc_dmcub), FW_SIZE(dmcub), list, 0) & 0xFF;
+-	LOG("fw: DCN %llx: queued yellow_carp DMCUB (%#x bytes) -> %llu", ver & 0xFFFFFFFF, FW_SIZE(dmcub), ok);
++			reinterpret_cast<uint64_t>(fw_apu_dmcub), FW_SIZE(dmcub), list, 0) & 0xFF;
++	LOG("fw: DCN %llx: queued the embedded DMCUB (%#x bytes) -> %llu", ver & 0xFFFFFFFF, FW_SIZE(dmcub), ok);
+ 	return r;
+ }
+ 
++bool gFwHooksOk;     // the PSP hooks of this stage are in place
++size_t gFwSubsDone;  // GC descriptors pointed at the embedded images (11 = all)
++
+ }  // namespace
+ 
++// Stage 3 preflight: is the embedded firmware the set for this chip, and did every hook and
++// descriptor substitution of firmwareRoute succeed?
++bool firmwareReady(const char *set) {
++	size_t n = strlen(set);
++	bool right = !strncmp(fw_apu_manifest, "set=", 4) && !strncmp(fw_apu_manifest + 4, set, n) && fw_apu_manifest[4 + n] == ' ';
++	if (!right || !gFwHooksOk || gFwSubsDone != 11 || !FW_SIZE(toc))
++		LOG("fw: not ready: want set %s, hooks %d, descriptors %zu of 11, TOC %#x bytes; embedded: %.60s", set, gFwHooksOk,
++		    gFwSubsDone, FW_SIZE(toc), fw_apu_manifest);
++	return right && gFwHooksOk && gFwSubsDone == 11 && FW_SIZE(toc);
++}
+ 
+ void firmwareRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
++	LOG("fw: embedded %s", fw_apu_manifest);
+ 	const Substitution subs[] {
+-		{"_gc_10_3_4_me_ucode", fw_yc_me, FW_SIZE(me)},
+-		{"_gc_10_3_4_pfp_ucode", fw_yc_pfp, FW_SIZE(pfp)},
+-		{"_gc_10_3_4_ce_ucode", fw_yc_ce, FW_SIZE(ce)},
+-		{"_gc_10_3_4_mec_ucode", fw_yc_mec, FW_SIZE(mec)},
+-		{"_gc_10_3_4_mec_jt_ucode", fw_yc_mec_jt, FW_SIZE(mec_jt)},
+-		{"_gc_10_3_4_rlc_ucode", fw_yc_rlc, FW_SIZE(rlc)},
+-		{"_gc_10_3_4_rlc_srlist_cntl", fw_yc_srlist_cntl, FW_SIZE(srlist_cntl)},
+-		{"_gc_10_3_4_rlc_srlist_gpm_mem", fw_yc_srlist_gpm, FW_SIZE(srlist_gpm)},
+-		{"_gc_10_3_4_rlc_srlist_srm_mem", fw_yc_srlist_srm, FW_SIZE(srlist_srm)},
+-		{"_gc_10_3_4_rlc_lx6_iram_ucode", fw_yc_rlc_iram, FW_SIZE(rlc_iram)},
+-		{"_gc_10_3_4_rlc_lx6_dram_ucode", fw_yc_rlc_dram, FW_SIZE(rlc_dram)},
++		{"_gc_10_3_4_me_ucode", fw_apu_me, FW_SIZE(me)},
++		{"_gc_10_3_4_pfp_ucode", fw_apu_pfp, FW_SIZE(pfp)},
++		{"_gc_10_3_4_ce_ucode", fw_apu_ce, FW_SIZE(ce)},
++		{"_gc_10_3_4_mec_ucode", fw_apu_mec, FW_SIZE(mec)},
++		{"_gc_10_3_4_mec_jt_ucode", fw_apu_mec_jt, FW_SIZE(mec_jt)},
++		{"_gc_10_3_4_rlc_ucode", fw_apu_rlc, FW_SIZE(rlc)},
++		{"_gc_10_3_4_rlc_srlist_cntl", fw_apu_srlist_cntl, FW_SIZE(srlist_cntl)},
++		{"_gc_10_3_4_rlc_srlist_gpm_mem", fw_apu_srlist_gpm, FW_SIZE(srlist_gpm)},
++		{"_gc_10_3_4_rlc_srlist_srm_mem", fw_apu_srlist_srm, FW_SIZE(srlist_srm)},
++		{"_gc_10_3_4_rlc_lx6_iram_ucode", fw_apu_rlc_iram, FW_SIZE(rlc_iram)},
++		{"_gc_10_3_4_rlc_lx6_dram_ucode", fw_apu_rlc_dram, FW_SIZE(rlc_dram)},
+ 	};
+ 	KernelPatcher::RouteRequest reqs[] {
+ 		{"_psp_tmr_init", wrapPspTmrInit, orgPspTmrInit},
+@@ -232,7 +261,11 @@ void firmwareRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t addre
+ 		if (!gPspTeardown[i])
+ 			LOG("fw: %s not found", pspTeardown[i]);
+ 	}
+-	if (!patcher.routeMultiple(index, reqs, address, size))
++	// Stage 3 takes the first two only: no DMUB image is queued (headless) and Apple's
++	// psp_power_down_event stays as it is (no sleep support at this stage).
++	size_t nreqs = rmbStage() == 3 ? 2 : arrsize(reqs);
++	gFwHooksOk = patcher.routeMultiple(index, reqs, nreqs, address, size);
++	if (!gFwHooksOk)
+ 		LOG("fw: failed to route PSP firmware hooks (err %d)", patcher.getError());
+ 	patcher.clearError();
+ 
+@@ -246,6 +279,7 @@ void firmwareRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t addre
+ 		auto oldSize = *reinterpret_cast<uint32_t *>(desc + 0x0C);
+ 		*reinterpret_cast<uint32_t *>(desc + 0x0C) = s.size;
+ 		*reinterpret_cast<const uint8_t **>(desc + 0x20) = s.data;
++		gFwSubsDone++;
+ 		LOG("fw: %s %#x -> %#x bytes", s.symbol + 11, oldSize, s.size);
+ 	}
+ }
+diff --git a/src/RembrandtGfx/fw.hpp b/src/RembrandtGfx/fw.hpp
+index 81f0c45..e41689c 100644
+--- a/src/RembrandtGfx/fw.hpp
++++ b/src/RembrandtGfx/fw.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+-// Firmware blobs embedded by fw.s.
+-#define FW_DECL(n) extern "C" const uint8_t fw_yc_##n[], fw_yc_##n##_end[];
++// Firmware blobs embedded by fw.s (the set chosen by FWSET at build time).
++#define FW_DECL(n) extern "C" const uint8_t fw_apu_##n[], fw_apu_##n##_end[];
+ FW_DECL(me)
+ FW_DECL(pfp)
+ FW_DECL(ce)
+@@ -15,4 +15,6 @@ FW_DECL(rlc_dram)
+ FW_DECL(sdma)
+ FW_DECL(toc)
+ FW_DECL(dmcub)
+-#define FW_SIZE(n) static_cast<uint32_t>(fw_yc_##n##_end - fw_yc_##n)
++#define FW_SIZE(n) static_cast<uint32_t>(fw_apu_##n##_end - fw_apu_##n)
++// "set=<name> <slot>=<file>:<ucode version>[/<feature version>]:<file size> ...", NUL-terminated.
++extern "C" const char fw_apu_manifest[];
+diff --git a/src/RembrandtGfx/fw.s b/src/RembrandtGfx/fw.s
+index 492ae22..19fdf1e 100644
+--- a/src/RembrandtGfx/fw.s
++++ b/src/RembrandtGfx/fw.s
+@@ -1,73 +1,78 @@
+-// Rembrandt (yellow_carp) firmware pieces, split from /usr/lib/firmware/amdgpu by
+-// scripts/fw-extract.py. AMD's redistributable firmware; kept local to this machine.
++// The APU's firmware pieces (FWSET in the Makefile: mendocino = Radeon 610M, yellow_carp = Radeon
++// 680M), split from /usr/lib/firmware/amdgpu by scripts/fw-extract.py. AMD's redistributable
++// firmware; kept local to this machine. fw/manifest.txt names the set and the file versions.
+ 	.section __DATA,__const
+-	.globl _fw_yc_me, _fw_yc_me_end
++	.globl _fw_apu_me, _fw_apu_me_end
+ 	.p2align 8
+-_fw_yc_me:
++_fw_apu_me:
+ 	.incbin "fw/me.bin"
+-_fw_yc_me_end:
+-	.globl _fw_yc_pfp, _fw_yc_pfp_end
++_fw_apu_me_end:
++	.globl _fw_apu_pfp, _fw_apu_pfp_end
+ 	.p2align 8
+-_fw_yc_pfp:
++_fw_apu_pfp:
+ 	.incbin "fw/pfp.bin"
+-_fw_yc_pfp_end:
+-	.globl _fw_yc_ce, _fw_yc_ce_end
++_fw_apu_pfp_end:
++	.globl _fw_apu_ce, _fw_apu_ce_end
+ 	.p2align 8
+-_fw_yc_ce:
++_fw_apu_ce:
+ 	.incbin "fw/ce.bin"
+-_fw_yc_ce_end:
+-	.globl _fw_yc_mec, _fw_yc_mec_end
++_fw_apu_ce_end:
++	.globl _fw_apu_mec, _fw_apu_mec_end
+ 	.p2align 8
+-_fw_yc_mec:
++_fw_apu_mec:
+ 	.incbin "fw/mec.bin"
+-_fw_yc_mec_end:
+-	.globl _fw_yc_mec_jt, _fw_yc_mec_jt_end
++_fw_apu_mec_end:
++	.globl _fw_apu_mec_jt, _fw_apu_mec_jt_end
+ 	.p2align 8
+-_fw_yc_mec_jt:
++_fw_apu_mec_jt:
+ 	.incbin "fw/mec_jt.bin"
+-_fw_yc_mec_jt_end:
+-	.globl _fw_yc_rlc, _fw_yc_rlc_end
++_fw_apu_mec_jt_end:
++	.globl _fw_apu_rlc, _fw_apu_rlc_end
+ 	.p2align 8
+-_fw_yc_rlc:
++_fw_apu_rlc:
+ 	.incbin "fw/rlc.bin"
+-_fw_yc_rlc_end:
+-	.globl _fw_yc_srlist_cntl, _fw_yc_srlist_cntl_end
++_fw_apu_rlc_end:
++	.globl _fw_apu_srlist_cntl, _fw_apu_srlist_cntl_end
+ 	.p2align 8
+-_fw_yc_srlist_cntl:
++_fw_apu_srlist_cntl:
+ 	.incbin "fw/srlist_cntl.bin"
+-_fw_yc_srlist_cntl_end:
+-	.globl _fw_yc_srlist_gpm, _fw_yc_srlist_gpm_end
++_fw_apu_srlist_cntl_end:
++	.globl _fw_apu_srlist_gpm, _fw_apu_srlist_gpm_end
+ 	.p2align 8
+-_fw_yc_srlist_gpm:
++_fw_apu_srlist_gpm:
+ 	.incbin "fw/srlist_gpm.bin"
+-_fw_yc_srlist_gpm_end:
+-	.globl _fw_yc_srlist_srm, _fw_yc_srlist_srm_end
++_fw_apu_srlist_gpm_end:
++	.globl _fw_apu_srlist_srm, _fw_apu_srlist_srm_end
+ 	.p2align 8
+-_fw_yc_srlist_srm:
++_fw_apu_srlist_srm:
+ 	.incbin "fw/srlist_srm.bin"
+-_fw_yc_srlist_srm_end:
+-	.globl _fw_yc_rlc_iram, _fw_yc_rlc_iram_end
++_fw_apu_srlist_srm_end:
++	.globl _fw_apu_rlc_iram, _fw_apu_rlc_iram_end
+ 	.p2align 8
+-_fw_yc_rlc_iram:
++_fw_apu_rlc_iram:
+ 	.incbin "fw/rlc_iram.bin"
+-_fw_yc_rlc_iram_end:
+-	.globl _fw_yc_rlc_dram, _fw_yc_rlc_dram_end
++_fw_apu_rlc_iram_end:
++	.globl _fw_apu_rlc_dram, _fw_apu_rlc_dram_end
+ 	.p2align 8
+-_fw_yc_rlc_dram:
++_fw_apu_rlc_dram:
+ 	.incbin "fw/rlc_dram.bin"
+-_fw_yc_rlc_dram_end:
+-	.globl _fw_yc_sdma, _fw_yc_sdma_end
++_fw_apu_rlc_dram_end:
++	.globl _fw_apu_sdma, _fw_apu_sdma_end
+ 	.p2align 8
+-_fw_yc_sdma:
++_fw_apu_sdma:
+ 	.incbin "fw/sdma.bin"
+-_fw_yc_sdma_end:
+-	.globl _fw_yc_toc, _fw_yc_toc_end
++_fw_apu_sdma_end:
++	.globl _fw_apu_toc, _fw_apu_toc_end
+ 	.p2align 8
+-_fw_yc_toc:
++_fw_apu_toc:
+ 	.incbin "fw/toc.bin"
+-_fw_yc_toc_end:
+-	.globl _fw_yc_dmcub, _fw_yc_dmcub_end
++_fw_apu_toc_end:
++	.globl _fw_apu_dmcub, _fw_apu_dmcub_end
+ 	.p2align 8
+-_fw_yc_dmcub:
++_fw_apu_dmcub:
+ 	.incbin "fw/dmcub.bin"
+-_fw_yc_dmcub_end:
++_fw_apu_dmcub_end:
++	.globl _fw_apu_manifest
++_fw_apu_manifest:
++	.incbin "fw/manifest.txt"
++	.byte 0
+diff --git a/src/RembrandtGfx/golden.cpp b/src/RembrandtGfx/golden.cpp
+index 794c50c..8ce781c 100644
+--- a/src/RembrandtGfx/golden.cpp
++++ b/src/RembrandtGfx/golden.cpp
+@@ -1,5 +1,6 @@
+ //
+-//  GC golden register settings for Rembrandt (GC 10.3.3), from Linux gfx_v10_0.c.
++//  GC golden register settings for Rembrandt (GC 10.3.3) and Mendocino (GC 10.3.7), from Linux
++//  gfx_v10_0.c. The table is picked by the GC version HWLibs read from the hardware.
+ //
+ 
+ #include "rmb.hpp"
+@@ -37,12 +38,65 @@ const Golden kGoldenGc1033[] {
+ 	{GcSeg0 + 0x1588, 0xffffffff, 0x00100000},  // UTCL1_CTRL
+ };
+ 
++// Linux v6.12 golden_settings_gc_10_3_7 (amdgpu/gfx_v10_0.c:3614-3637, applied for IP 10.3.7 at
++// :3901-3905), same order. Against 10.3.3 (:3455-3476): GB_ADDR_CONFIG value 0x41, GL2A/GL2C
++// ADDR_MATCH_MASK 0xffffffff, PA_CL_ENHANCE mask 0xf000003f, and two more rows, SQG_CONFIG and
++// SX_DEBUG_1. Offsets: include/asic_reg/gc/gc_10_3_0_offset.h (mmSQG_CONFIG 0x10ba :2556,
++// mmSX_DEBUG_1 0x11b8 :2668, both BASE_IDX 0), mmCGTT_SPI_CS_CLK_CTRL 0x507c idx 1 and
++// mmGCR_GENERAL_CNTL_Vangogh 0x1580 idx 0 from gfx_v10_0.c:136-137,176-177. GL2C_CTRL3 and
++// TA_CNTL_AUX are left out as in the 10.3.3 table above (offsets not in the gc_10_3_0 headers).
++const Golden kGoldenGc1037[] {
++	{GcSeg1 + 0x507c, 0xff7f0fff, 0x78000100},  // CGTT_SPI_CS_CLK_CTRL
++	{GcSeg1 + 0x2d90, 0x000000ff, 0x000000e4},  // CH_PIPE_STEER
++	{GcSeg0 + 0x1f53, 0x0007ffff, 0x0000c200},  // CPF_GCR_CNTL
++	{GcSeg0 + 0x13ae, 0xffffffff, 0x00000280},  // DB_DEBUG3
++	{GcSeg0 + 0x13af, 0xffffffff, 0x00800000},  // DB_DEBUG4
++	{GcSeg0 + 0x13de, 0x0c1807ff, 0x00000041},  // GB_ADDR_CONFIG
++	{GcSeg0 + 0x1580, 0x1ff1ffff, 0x00000500},  // GCR_GENERAL_CNTL
++	{GcSeg1 + 0x2d10, 0x000000ff, 0x000000e4},  // GL1_PIPE_STEER
++	{GcSeg1 + 0x2e25, 0x77777777, 0x32103210},  // GL2_PIPE_STEER_0
++	{GcSeg1 + 0x2e26, 0x77777777, 0x32103210},  // GL2_PIPE_STEER_1
++	{GcSeg1 + 0x2e21, 0xffffffff, 0xffffffff},  // GL2A_ADDR_MATCH_MASK
++	{GcSeg1 + 0x2e03, 0xffffffff, 0xffffffff},  // GL2C_ADDR_MATCH_MASK
++	{GcSeg1 + 0x2e08, 0xff8fff0f, 0x580f1008},  // GL2C_CM_CTRL1
++	{GcSeg0 + 0x10a2, 0x000001ff, 0x00000020},  // LDS_CONFIG
++	{GcSeg0 + 0x1025, 0xf000003f, 0x01200007},  // PA_CL_ENHANCE
++	{GcSeg0 + 0x1070, 0xffffffff, 0x00000800},  // PA_SC_BINNER_TIMEOUT_COUNTER
++	{GcSeg0 + 0x107c, 0xffffffbf, 0x00000820},  // PA_SC_ENHANCE_2
++	{GcSeg0 + 0x10ba, 0x000017ff, 0x00001000},  // SQG_CONFIG
++	{GcSeg0 + 0x11b8, 0xffffff7f, 0x00010020},  // SX_DEBUG_1
++	{GcSeg0 + 0x1588, 0xffffffff, 0x00100000},  // UTCL1_CTRL
++};
++
++// The table for the GC version HWLibs read (0xa0303 = 680M, 0xa0307 = 610M) and the value its
++// GL2C_ADDR_MATCH_MASK row sets, which the guard watches. Unknown version: no table, nothing written.
++bool goldenFor(const Golden *&table, size_t &count, uint32_t &gl2cMask) {
++	switch (gcHwVersion()) {
++		case 0xa0303:
++			table = kGoldenGc1033, count = arrsize(kGoldenGc1033), gl2cMask = 0xfffffff3;
++			return true;
++		case 0xa0307:
++			table = kGoldenGc1037, count = arrsize(kGoldenGc1037), gl2cMask = 0xffffffff;
++			return true;
++		default:
++			return false;
++	}
++}
++
+ }  // namespace
+ 
+ void applyGcGolden() {
++	const Golden *table;
++	size_t count;
++	uint32_t gl2cMask;
++	if (!goldenFor(table, count, gl2cMask)) {
++		LOG("golden: no table for GC version %x, nothing written", gcHwVersion());
++		return;
++	}
+ 	LOG("golden: GL2C_ADDR_MATCH_MASK %x UTCL1_CTRL %x GRBM_STATUS %x", mmioRead(GcSeg1 + 0x2e03), mmioRead(GcSeg0 + 0x1588),
+ 		mmioRead(GcSeg0 + 0xda4));
+-	for (auto &g : kGoldenGc1033) {
++	for (size_t i = 0; i < count; i++) {
++		auto &g = table[i];
+ 		uint32_t old = mmioRead(g.reg);
+ 		uint32_t val = g.mask == 0xffffffff ? g.value : (old & ~g.mask) | (g.value & g.mask);
+ 		if (val != old) {
+@@ -79,11 +133,15 @@ void syncSdmaAddrConfig(const char *when) {
+ static void guard(void *, wait_result_t) {
+ 	uint64_t t0;
+ 	clock_get_uptime(&t0);
+-	uint32_t hits = 0;
++	uint32_t hits = 0, want = 0;
++	const Golden *table;
++	size_t count;
++	if (!goldenFor(table, count, want))
++		return;
+ 	for (uint32_t i = 0; i < 3000; i++) {
+ 		IOSleep(1);
+ 		uint32_t m = mmioRead(GcSeg1 + 0x2e03);
+-		if (m == 0xfffffff3)
++		if (m == want)
+ 			continue;
+ 		uint64_t now, ns;
+ 		clock_get_uptime(&now);
+diff --git a/src/RembrandtGfx/ipdisc.cpp b/src/RembrandtGfx/ipdisc.cpp
+index 54387ea..36edaf1 100644
+--- a/src/RembrandtGfx/ipdisc.cpp
++++ b/src/RembrandtGfx/ipdisc.cpp
+@@ -49,14 +49,14 @@
+ 
+ // Bring-up stage of the 610M port (see rmb.hpp). 0 = full driver as upstream, only with -rmbnoprobe
+ // and without -rmbprobe (-rmbprobe wins if both are given). Otherwise rmbstage=N: 1 (default, and
+-// the fallback for any other value) or 2.
++// the fallback for any other value), 2 or 3.
+ uint32_t rmbStage() {
+ 	static int stage = -1;
+ 	if (stage < 0) {
+ 		uint32_t n = 1;
+ 		if (!checkKernelArgument("-rmbprobe") && checkKernelArgument("-rmbnoprobe"))
+ 			n = 0;
+-		else if (!lilu_get_boot_args("rmbstage", &n, sizeof(n)) || n != 2)
++		else if (!lilu_get_boot_args("rmbstage", &n, sizeof(n)) || (n != 2 && n != 3))
+ 			n = 1;
+ 		stage = static_cast<int>(n);
+ 	}
+@@ -77,6 +77,12 @@ constexpr IOOptionBits MapRo = kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadO
+ uint8_t gBin[BinSize];  // copy of the table: all parsing reads this, never the hardware
+ uint32_t gLen;          // bytes of gBin that were really read (<= BinSize); the rest is zero
+ 
++// What the last table that passed every check listed (first MaxRecs IPs), for the stage 3 preflight.
++struct IpRec { uint32_t hw, inst, major, minor, rev, bases, base[2]; };
++constexpr uint32_t MaxRecs = 64;
++IpRec gIps[MaxRecs];
++uint32_t gIpCount;  // 0 unless parse() reached its OK line
++
+ // Is [off, off + n) inside what was read? Checked before every le16/le32/byteSum below.
+ bool inBin(uint32_t off, uint32_t n) { return off <= gLen && n <= gLen - off; }
+ uint32_t le16(uint32_t off) { return gBin[off] | static_cast<uint32_t>(gBin[off + 1]) << 8; }
+@@ -128,6 +134,7 @@ void mmCopy(Regs &r, uint64_t pos, uint32_t &idx, uint32_t &hi) {
+ // +14 die_info[16] {id, offset}, +78 bit 0 = 64-bit bases. die_header: {id, num_ips}. ip (8 B +
+ // bases): hw_id, instance, num_base_address, major, minor, revision, (sub-revision/variant).
+ void parse(uint64_t pos) {
++	gIpCount = 0;
+ 	if (gLen < 4 || le32(0) != BinSig) {
+ 		LOG("probe: FAIL no binary signature at VRAM offset %llx: first word %08x (want %08x), %u bytes read", pos,
+ 		    le32(0), BinSig, gLen);
+@@ -176,9 +183,14 @@ void parse(uint64_t pos) {
+ 				              b64 ? le32(off + 8 + b * 8) & 0x3FFFFFFF : le32(off + 8 + b * 4));
+ 			LOG("probe: ip die%u %u/%u hw_id=%u v=%u.%u.%u bases=%s%s", d, le16(off), gBin[off + 2], le16(off),
+ 			    gBin[off + 4], gBin[off + 5], gBin[off + 6], bases, nb > MaxBases ? " ..." : "");
++			if (total < MaxRecs) {
++				auto base = [&](uint32_t b) { return b >= nb ? 0 : b64 ? le32(off + 8 + b * 8) & 0x3FFFFFFF : le32(off + 8 + b * 4); };
++				gIps[total] = {le16(off), gBin[off + 2], gBin[off + 4], gBin[off + 5], gBin[off + 6], nb, {base(0), base(1)}};
++			}
+ 			off += len;
+ 		}
+ 	}
++	gIpCount = total < MaxRecs ? total : MaxRecs;
+ 	LOG("probe: OK %u dies, %u ips listed", dies, total);
+ }
+ 
+@@ -315,3 +327,19 @@ void probe(IOService *svc, bool retry) {
+ void ipDiscProbe(IOService *svc) {
+ 	probe(svc, false);
+ }
++
++// Stage 3 preflight: is instance 0 of hwId in the table read at this boot, with this version and
++// these first two base addresses (~0 = don't care)? False when no table passed its checks.
++bool ipDiscIs(uint32_t hwId, uint32_t major, uint32_t minor, uint32_t rev, uint32_t base0, uint32_t base1) {
++	for (uint32_t i = 0; i < gIpCount; i++) {
++		auto &ip = gIps[i];
++		if (ip.hw != hwId || ip.inst != 0)
++			continue;
++		LOG("stage 3 preflight: table has hw_id %u v%u.%u.%u bases %x %x (%u), want v%u.%u.%u bases %x %x", hwId, ip.major,
++		    ip.minor, ip.rev, ip.base[0], ip.base[1], ip.bases, major, minor, rev, base0, base1);
++		return ip.major == major && ip.minor == minor && ip.rev == rev && (base0 == ~0u || (ip.bases >= 1 && ip.base[0] == base0)) &&
++		       (base1 == ~0u || (ip.bases >= 2 && ip.base[1] == base1));
++	}
++	LOG("stage 3 preflight: hw_id %u not in the table read at this boot (%u ips recorded)", hwId, gIpCount);
++	return false;
++}
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 7c860bf..142e4cc 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -174,9 +174,11 @@ static uint64_t wrapFbStart(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, ui
+ 	LOG("headless: AmdRadeonFramebuffer start declined");
+ 	return 0;
+ }
+-// Stage 2 fallback, used only when the write-blocking register hooks could not all be installed.
++// Stages 2 and 3: the headless route and all six write-dropping register hooks are in place.
++static bool gFbStagedOk;
++// Stage 2 / 3 fallback, used only when the write-blocking register hooks could not all be installed.
+ static uint64_t wrapCtrlStartDeclined(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+-	LOG("stage 2: AmdRadeonController start declined (register hooks missing)");
++	LOG("stage %u: AmdRadeonController start declined (register hooks missing)", rmbStage());
+ 	return 0;
+ }
+ 
+@@ -464,9 +466,10 @@ static void safeModes(KernelPatcher &patcher, size_t index, mach_vm_address_t ad
+ }
+ 
+ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+-	// Stage 2: headless always; of the code patches only the pipe count (DAL builds its resource pool
+-	// in software); register hooks in write-dropping mode; no IH, mode or display hooks.
+-	bool s2 = rmbStage() == 2, s2WritesBlocked = false;
++	// Stages 2 and 3: headless always; of the code patches only the pipe count (DAL builds its
++	// resource pool in software); register hooks in write-dropping mode; no mode or display hooks.
++	// Stage 3 adds the IH wptr patch: with the accelerator running, a GPU interrupt must not storm.
++	bool s3 = rmbStage() == 3, s2 = rmbStage() == 2 || s3, s2WritesBlocked = false;
+ 	if (!s2)
+ 		capHdmiPixelClock(address, size);
+ 	capPipes(address, size);
+@@ -474,6 +477,8 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 		ihMmioWptr(patcher, address, size);
+ 		safeModes(patcher, index, address, size);
+ 	} else {
++		if (s3)
++			ihMmioWptr(patcher, address, size);
+ 		s2WritesBlocked = displayRouteStage2(patcher, index, address, size);
+ 	}
+ 	gHeadless = s2 || checkKernelArgument("-rmbheadless");
+@@ -481,8 +486,10 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 		KernelPatcher::RouteRequest req {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer5startEP9IOService", wrapFbStart};
+ 		if (!patcher.routeMultiple(index, &req, 1, address, size))
+ 			LOG("headless: failed to route framebuffer start (err %d)", patcher.getError());
+-		else
++		else {
+ 			LOG("headless: framebuffers disabled");
++			gFbStagedOk = s2WritesBlocked;
++		}
+ 		patcher.clearError();
+ 	}
+ 	KernelPatcher::RouteRequest traces[] {
+@@ -526,11 +533,16 @@ static uint64_t wrap_pcie_ip_sw_init(uint64_t, uint64_t, uint64_t, uint64_t, uin
+ // Navi 23 (0x73FF) rows have internal revision 0; Rembrandt reports its own, so no row matches.
+ // Look up the Navi 23 row with internal revision 0 and the real PCI revision.
+ static mach_vm_address_t org_ttlSetDeviceCapabilityEntry;
++// What HWLibs' software init showed at this boot, for the stage 3 preflight (-1 / 0 = not seen).
++static int64_t gSawCapEntry = -1, gSawPspInit = -1;
++static uint32_t gSawPspMajor, gSawGcVersion;
++uint32_t gcHwVersion() { return gSawGcVersion; }
+ static uint64_t wrap_ttlSetDeviceCapabilityEntry(uint64_t ctx, uint64_t dev, uint64_t intRev, uint64_t extRev, uint64_t e, uint64_t f) {
+ 	LOG("ttlSetDeviceCapabilityEntry(dev %llx, internal rev %llx, external rev %llx) -> using internal rev 0",
+ 		dev & 0xFFFFFFFF, intRev & 0xFFFFFFFF, extRev & 0xFFFFFFFF);
+ 	auto r = reinterpret_cast<Fn6>(org_ttlSetDeviceCapabilityEntry)(ctx, dev, 0, extRev, e, f);
+ 	LOG("ttlSetDeviceCapabilityEntry = %llx", r & 0xFF);
++	gSawCapEntry = r & 0xFF;
+ 	return r;
+ }
+ 
+@@ -547,6 +559,7 @@ static mach_vm_address_t org_psp_asic_type_init;
+ static uint64_t wrap_psp_asic_type_init(uint64_t psp, uint64_t info, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	auto ip = reinterpret_cast<uint32_t *>(info);
+ 	LOG("psp_asic_type_init: MP0 %u.%u.%u", ip[2], ip[3], ip[4]);
++	gSawPspMajor = ip[2];
+ 	uint8_t copy[0x260];
+ 	if (ip[2] == 13) {
+ 		memcpy(copy, ip, sizeof(copy));
+@@ -557,6 +570,7 @@ static uint64_t wrap_psp_asic_type_init(uint64_t psp, uint64_t info, uint64_t c,
+ 	}
+ 	auto r = reinterpret_cast<Fn6>(org_psp_asic_type_init)(psp, info, c, d, e, f);
+ 	LOG("psp_asic_type_init = %llx, psp type %u", r & 0xFFFFFFFF, *reinterpret_cast<uint32_t *>(psp + 0x7d94));
++	gSawPspInit = r & 0xFFFFFFFF;
+ 	return r;
+ }
+ 
+@@ -566,6 +580,7 @@ static uint64_t wrap_psp_asic_type_init(uint64_t psp, uint64_t info, uint64_t c,
+ static mach_vm_address_t org_gc_get_hw_version;
+ static uint64_t wrap_gc_get_hw_version(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	auto v = reinterpret_cast<Fn6>(org_gc_get_hw_version)(a, b, c, d, e, f) & 0xFFFFFFFF;
++	gSawGcVersion = static_cast<uint32_t>(v);
+ 	static bool logged;
+ 	if (!logged) {
+ 		logged = true;
+@@ -712,21 +727,85 @@ static uint64_t wrap_gc_10_3_initialize_registers(uint64_t a, uint64_t b, uint64
+ BLOCK_HOOK(ttl_hw_init)
+ BLOCK_HOOK(psp_hw_init)
+ 
+-// Hooks that only matter once hardware init runs; stage 2 does not install them.
+-static bool stage2Skips(const char *symbol) {
++// Hooks that only matter once hardware init runs; stage 2 does not install them. Stage 3 leaves out
++// only the last two (the wake-time VBIOS POST: no sleep support at that stage).
++static bool stage2Skips(const char *symbol, bool s3) {
+ 	static const char *const skip[] {"_execute_register_golden_settings", "_gc_10_3_initialize_registers",
+ 		"_psp_ring_create", "_psp_power_up_event", "_vbs_hw_init"};
+-	for (auto s : skip)
+-		if (!strcmp(symbol, s))
++	for (size_t i = s3 ? 3 : 0; i < arrsize(skip); i++)
++		if (!strcmp(symbol, skip[i]))
+ 			return true;
+ 	return false;
+ }
+ 
++// Stage 3 (rmbstage=3): hardware init runs only if everything stage 2 was meant to establish holds at
++// THIS boot. Each line is an assumption M3 inherits from M2; one FAIL and ttl_hw_init is blocked
++// exactly as at stage 2, with nothing written. Numbers: Linux soc15_hw_ip.h hardware ids (GC 11,
++// MP0 255, MP1 1, SDMA0 42); bases as in this file, smu.cpp, golden.cpp and probe.cpp.
++static bool gStage3Armed;
++bool rmbStage3Armed() { return gStage3Armed; }
++static bool pciIdentitySeen();  // below, next to the IOPCIFamily hooks
++
++static bool stage3Preflight() {
++	const struct { const char *what; bool ok; } checks[] {
++		{"PCI identity hook saw 1002:1506", pciIdentitySeen()},
++		{"register aperture mapped (BAR 5 is 512 KB)", mmioAvailable()},
++		{"capability row found (ttlSetDeviceCapabilityEntry = 1)", gSawCapEntry == 1},
++		{"PSP type set (MP0 major 13, psp_asic_type_init = 0)", gSawPspMajor == 13 && gSawPspInit == 0},
++		{"HWLibs read GC 10.3.7 (a0307)", gSawGcVersion == 0xa0307},
++		{"PMFW answered GetSmuVersion", smuPmfwOk()},
++		{"discovery table: GC 10.3.7, bases 0x1260 / 0xA000", ipDiscIs(11, 10, 3, 7, 0x1260, 0xA000)},
++		{"discovery table: MP0 13.0.8, base 0x16000", ipDiscIs(255, 13, 0, 8, 0x16000, ~0u)},
++		{"discovery table: MP1 13.0.8, base 0x16000", ipDiscIs(1, 13, 0, 8, 0x16000, ~0u)},
++		{"discovery table: SDMA0 5.2.7, base 0x1260", ipDiscIs(42, 5, 2, 7, 0x1260, ~0u)},
++		{"firmware: mendocino set, 11 GC descriptors and the PSP hooks in place", firmwareReady("mendocino")},
++		{"framebuffer: headless, 6 write-dropping register hooks", gFbStagedOk},
++	};
++	bool all = true;
++	for (auto &c : checks) {
++		LOG("stage 3 preflight: %s: %s", c.what, c.ok ? "ok" : "FAIL");
++		all = all && c.ok;
++	}
++	return all;
++}
++
++static mach_vm_address_t org_ttl_hw_init_s3, org_psp_hw_init_s3;
++static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	if (!stage3Preflight()) {
++		LOG("stage 3: ttl_hw_init BLOCKED by the preflight, returning 1 without running Apple's code");
++		return 1;
++	}
++	gStage3Armed = true;
++	LOG("stage 3: preflight passed, hardware init allowed");
++	smuStage3BeforeHwInit();
++	LOG(">> ttl_hw_init(%llx, %llx)", a, b);
++	auto r = reinterpret_cast<Fn6>(org_ttl_hw_init_s3)(a, b, c, d, e, f);
++	LOG("<< ttl_hw_init = %llx", r);
++	return r;
++}
++
++// -rmbpsponly: let Apple's psp_hw_init run (rings, TMR, firmware load), then report failure so
++// ttl_hw_init stops before the GC is brought up, and go back to stage 2's write rules.
++static uint64_t stage3_psp_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	if (!gStage3Armed) {
++		LOG("stage 3: psp_hw_init BLOCKED (the preflight has not passed), returning 1 without running Apple's code");
++		return 1;
++	}
++	LOG(">> psp_hw_init(%llx, %llx)", a, b);
++	auto r = reinterpret_cast<Fn6>(org_psp_hw_init_s3)(a, b, c, d, e, f);
++	LOG("<< psp_hw_init = %llx", r);
++	if (!checkKernelArgument("-rmbpsponly"))
++		return r;
++	gStage3Armed = false;
++	LOG("stage 3: -rmbpsponly: stopping after psp_hw_init, reporting failure to its caller, writes blocked again");
++	return (r & 0xFFFFFFFF) ? r : 1;
++}
++
+ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+-	bool s2 = rmbStage() == 2;
++	bool s2 = rmbStage() == 2, s3 = rmbStage() == 3;
+ 	KernelPatcher::RouteRequest requests[] {
+ 		{"_ttl_sw_init", wrap_ttl_sw_init, org_ttl_sw_init},
+-		{"_ttl_hw_init", s2 ? block_ttl_hw_init : wrap_ttl_hw_init, org_ttl_hw_init},
++		{"_ttl_hw_init", s3 ? stage3_ttl_hw_init : s2 ? block_ttl_hw_init : wrap_ttl_hw_init, s3 ? org_ttl_hw_init_s3 : org_ttl_hw_init},
+ 		{"_IpiSwInit", wrap_IpiSwInit, org_IpiSwInit},
+ 		{"_IpiHwInit", wrap_IpiHwInit, org_IpiHwInit},
+ 		{"_TlsSwInit", wrap_TlsSwInit, org_TlsSwInit},
+@@ -758,7 +837,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"_gc_set_fw_entry_info", wrap_gc_set_fw_entry_info, org_gc_set_fw_entry_info},
+ 		{"_gc_init_fcn_ptr_list", wrap_gc_init_fcn_ptr_list, org_gc_init_fcn_ptr_list},
+ 		{"_gc_validate_hw_config_tbl_version", wrap_gc_validate_hw_config_tbl_version, org_gc_validate_hw_config_tbl_version},
+-		{"_psp_hw_init", s2 ? block_psp_hw_init : wrap_psp_hw_init, org_psp_hw_init},
++		{"_psp_hw_init", s3 ? stage3_psp_hw_init : s2 ? block_psp_hw_init : wrap_psp_hw_init, s3 ? org_psp_hw_init_s3 : org_psp_hw_init},
+ 		{"_psp_init_pfn_ptr", wrap_psp_init_pfn_ptr, org_psp_init_pfn_ptr},
+ 		{"_ttlDevCreateInstance", wrap_ttlDevCreateInstance, org_ttlDevCreateInstance},
+ 		{"_ttl_cgs_initialize", wrap_ttl_cgs_initialize, org_ttl_cgs_initialize},
+@@ -782,7 +861,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"__ZN14AmdTtlServices13initializePrmEv", wrap_TtlInitializePrm, org_TtlInitializePrm},
+ 	};
+ 	for (auto &r : requests) {
+-		if (s2 && stage2Skips(r.symbol))
++		if ((s2 || s3) && stage2Skips(r.symbol, s3))
+ 			continue;
+ 		if (!patcher.routeMultiple(index, &r, 1, address, size))
+ 			LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
+@@ -800,6 +879,8 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		LOG("stage 2: ttl_hw_init and psp_hw_init blocked, firmware and golden hooks not installed");
+ 	else
+ 		firmwareRoute(patcher, index, address, size);
++	if (s3)
++		LOG("stage 3: ttl_hw_init runs only if the preflight passes; wake POST hooks not installed");
+ 	LOG("HWLibs hooks installed");
+ }
+ 
+@@ -880,7 +961,8 @@ static bool kinfoReady(size_t i) {
+ 
+ static void scanKmods() {
+ 	// Stage 1: no kext is hooked or patched. Stage 2: IOPCIFamily, HWLibs and the framebuffer only
+-	// (not the accelerator, AppleBacklight, AGDC, AppleUSBXHCI or NVAccel). Stage 0: everything.
++	// (not the accelerator, AppleBacklight, AGDC, AppleUSBXHCI or NVAccel). Stage 3: stage 2 plus the
++	// accelerator. Stage 0: everything.
+ 	uint32_t stage = rmbStage();
+ 	if (!gKmods || stage == 1)
+ 		return;
+@@ -899,7 +981,7 @@ static void scanKmods() {
+ 			nvFound = true;
+ 			nvCopyPatch(kmod->address, kmod->size);
+ 		}
+-		for (size_t i = 0; i < (full ? 3 : 2); i++) {  // 0 = HWLibs, 1 = Framebuffer, 2 = Accelerator
++		for (size_t i = 0; i < (full || stage == 3 ? 3 : 2); i++) {  // 0 = HWLibs, 1 = Framebuffer, 2 = Accelerator
+ 			if (hooked[i] || strncmp(kmod->name, kexts[i].id, KMOD_MAX_NAME) || !kinfoReady(i))
+ 				continue;
+ 			hooked[i] = true;
+@@ -998,6 +1080,8 @@ static void routePciDevid(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 	patcher.clearError();
+ }
+ 
++static bool pciIdentitySeen() { return gDevidLogged; }
++
+ static OSReturn wrapOSKextStart(void *kext, bool startDependencies) {
+ 	scanKmods();
+ 	return FunctionCast(wrapOSKextStart, orgOSKextStart)(kext, startDependencies);
+@@ -1013,6 +1097,8 @@ static void pluginStart() {
+ 		LOG("starting at stage 1: no kext hooks, only MM_INDEX/MM_INDEX_HI written and restored (rmbstage=2 = identity + software init, -rmbnoprobe = full driver)");
+ 	else if (stage == 2)
+ 		LOG("starting at stage 2: identity + software init hooks, hardware init blocked, writes: MM_INDEX pair + one GetSmuVersion (-rmbnoprobe = full driver)");
++	else if (stage == 3)
++		LOG("starting at stage 3: stage 2 + firmware and accelerator hooks; hardware init (PSP, firmware, GC) runs if the preflight passes; headless, display engine untouched (-rmbnoprobe = full driver)");
+ 	else
+ 		LOG("starting");
+ 	ihQuiesceAtBoot();
+diff --git a/src/RembrandtGfx/mmio.cpp b/src/RembrandtGfx/mmio.cpp
+index f218eb1..ed9d383 100644
+--- a/src/RembrandtGfx/mmio.cpp
++++ b/src/RembrandtGfx/mmio.cpp
+@@ -59,11 +59,23 @@ uint32_t mmioRead(uint32_t reg) {
+ // query at init (smu_v13_0_check_fw_version, pm/swsmu/smu13/smu_v13_0.c:254-263). Nothing else.
+ static bool stage2MayWrite(uint32_t reg, uint32_t value) {
+ 	constexpr uint32_t Msg = 0x16000 + 0x282, Arg = 0x16000 + 0x292, Resp = 0x16000 + 0x29a;
+-	return rmbStage() == 2 && ((reg == Resp && !value) || (reg == Arg && !value) || (reg == Msg && value == 0x02));
++	uint32_t stage = rmbStage();  // stage 3 before its preflight passes is stage 2
++	return (stage == 2 || stage == 3) && ((reg == Resp && !value) || (reg == Arg && !value) || (reg == Msg && value == 0x02));
++}
++
++// Stage 3, only once the preflight passed (rmbStage3Armed): GC and SDMA0 (GC segments 0 and 1:
++// engines, golden settings, queue and fault registers), the PSP's C2PMSG_64 (destroy rings) and the
++// PMFW mailbox (smu.cpp decides which messages). The bases are the ones the preflight checked against
++// the discovery table. Nothing in the display engine (DCN, DMCUB, PHY, IH, display SMU mailbox
++// 0x16283/93/9b) and not MM_INDEX.
++static bool stage3MayWrite(uint32_t reg) {
++	return rmbStage() == 3 && rmbStage3Armed() &&
++	       ((reg >= 0x1260 && reg < 0x34C0) || (reg >= 0xA000 && reg < 0x10000) || reg == 0x16080 ||
++	        reg == 0x16000 + 0x282 || reg == 0x16000 + 0x292 || reg == 0x16000 + 0x29a);
+ }
+ 
+ void mmioWrite(uint32_t reg, uint32_t value) {
+-	if (rmbProbe() && !stage2MayWrite(reg, value)) {  // stages 1 and 2: no register write, whoever asks
++	if (rmbProbe() && !stage2MayWrite(reg, value) && !stage3MayWrite(reg)) {  // stages 1-3: only what the stage lists
+ 		static uint32_t dropped;
+ 		if (dropped++ < 40)
+ 			LOG("mmio: stage %u dropped write %x = %x (#%u)", rmbStage(), reg, value, dropped);
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 98a1ff0..3b1653d 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -23,10 +23,23 @@ bool rmbVerbose();
+ //   2  rmbstage=2: stage 1 plus the PCI identity hooks, the HWLibs identity / software-init hooks and
+ //      a headless, write-blocking set of framebuffer hooks. ttl_hw_init and psp_hw_init fail before
+ //      Apple's code runs; mmioWrite passes only the three mailbox writes of one GetSmuVersion query.
++//   3  rmbstage=3: stage 2 plus the firmware and accelerator hooks, and hardware init (PSP, firmware
++//      load, GC) is let through, still headless and without touching the display engine or the
++//      DMCUB. Until the preflight in front of ttl_hw_init passes (rmbStage3Armed) every write rule
++//      is stage 2's; if it fails, ttl_hw_init is blocked as at stage 2. -rmbpsponly stops after
++//      Apple's psp_hw_init; -rmbmode2 sends the MODE2 reset (not sent otherwise).
+ //   0  full driver as upstream: only with -rmbnoprobe (and without -rmbprobe, which wins).
+-// rmbProbe() = stage 1 or 2.
++// rmbProbe() = stage 1, 2 or 3.
+ uint32_t rmbStage();
+ bool rmbProbe();
++bool rmbStage3Armed();
++// Stage 3 preflight inputs: the discovery table read at this boot (ipdisc.cpp), the PMFW's answer
++// (smu.cpp), the embedded firmware set and its hooks (firmware.cpp), the GC version HWLibs read.
++bool ipDiscIs(uint32_t hwId, uint32_t major, uint32_t minor, uint32_t rev, uint32_t base0, uint32_t base1);
++bool smuPmfwOk();
++void smuStage3BeforeHwInit();
++bool firmwareReady(const char *set);
++uint32_t gcHwVersion();
+ class IOService;
+ void ipDiscProbe(IOService *svc);
+ void safeModesLog();
+diff --git a/src/RembrandtGfx/smu.cpp b/src/RembrandtGfx/smu.cpp
+index 4f11d73..c641677 100644
+--- a/src/RembrandtGfx/smu.cpp
++++ b/src/RembrandtGfx/smu.cpp
+@@ -34,8 +34,14 @@ bool waitResp(uint32_t &resp, int ms = 1000) {
+ // Returns the PMFW response (1 = OK); the result argument is read back into arg.
+ uint32_t sendMsg(uint32_t msg, uint32_t &arg, int ms = 1000) {
+ 	uint32_t resp;
+-	if (rmbStage() == 2 && msg != PPSMC_MSG_GetSmuVersion) {  // stage 2 sends nothing that changes state
+-		LOG("smu: stage 2, msg %#x not sent", msg);
++	// Stage 2 (and stage 3 until its preflight passes) sends nothing that changes state. Armed stage 3
++	// adds DisallowGfxOff, and the MODE2 reset only with -rmbmode2.
++	uint32_t stage = rmbStage();
++	bool armed = stage == 3 && rmbStage3Armed();
++	bool allowed = msg == PPSMC_MSG_GetSmuVersion || (armed && msg == PPSMC_MSG_DisallowGfxOff) ||
++	               (armed && msg == PPSMC_MSG_GfxDeviceDriverReset && checkKernelArgument("-rmbmode2"));
++	if ((stage == 2 || stage == 3) && !allowed) {
++		LOG("smu: stage %u, msg %#x not sent", stage, msg);
+ 		return 0;
+ 	}
+ 	if (!waitResp(resp)) {
+@@ -54,6 +60,7 @@ uint32_t sendMsg(uint32_t msg, uint32_t &arg, int ms = 1000) {
+ }
+ 
+ uint8_t gContext[0x100];  // opaque handle handed back to TTL
++uint32_t gPmfwResp, gPmfwVersion;  // what GetSmuVersion returned at this boot (stage 3 preflight)
+ 
+ const char *const opNames[] {
+ 	"event_notify", "full_asic_reset", "per_engine_reset", "pp_table_control", "overdrive_control",
+@@ -87,8 +94,9 @@ uint64_t smuSwInit(uint64_t in, uint64_t out, uint64_t, uint64_t, uint64_t, uint
+ 	uint32_t arg = 0;
+ 	auto resp = sendMsg(PPSMC_MSG_GetSmuVersion, arg);
+ 	LOG("smu_sw_init: PMFW version %u.%u.%u (resp %u)", (arg >> 16) & 0xFF, (arg >> 8) & 0xFF, arg & 0xFF, resp);
+-	if (rmbStage() == 2) {  // no engine halt, no MODE2 reset: nothing that changes state is sent
+-		LOG("smu_sw_init: stage 2, only GetSmuVersion was sent");
++	gPmfwResp = resp, gPmfwVersion = arg;
++	if (rmbStage() == 2 || rmbStage() == 3) {  // no engine halt, no MODE2 reset: nothing that changes state is sent
++		LOG("smu_sw_init: stage %u, only GetSmuVersion was sent", rmbStage());  // stage 3: see smuStage3BeforeHwInit
+ 		return 0;
+ 	}
+ 
+@@ -115,8 +123,8 @@ uint64_t smuSwInit(uint64_t in, uint64_t out, uint64_t, uint64_t, uint64_t, uint
+ uint64_t smuHwInit(uint64_t handle, uint64_t in, uint64_t out, uint64_t, uint64_t, uint64_t) {
+ 	if (!handle || !in || !out)
+ 		return 1;
+-	if (rmbStage() == 2) {
+-		LOG("stage 2: smu_hw_init BLOCKED, returning 1, nothing sent");
++	if (rmbStage() == 2 || (rmbStage() == 3 && !rmbStage3Armed())) {
++		LOG("stage %u: smu_hw_init BLOCKED, returning 1, nothing sent", rmbStage());
+ 		return 1;
+ 	}
+ 	// Keep GFX powered while the PSP/RLC/GC bring-up below us pokes its registers.
+@@ -124,7 +132,10 @@ uint64_t smuHwInit(uint64_t handle, uint64_t in, uint64_t out, uint64_t, uint64_
+ 	LOG("smu_hw_init: DisallowGfxOff resp %u", sendMsg(PPSMC_MSG_DisallowGfxOff, arg));
+ 	applyGcGolden();
+ 	startGoldenGuard();
+-	dmubPollerStart();
++	if (rmbStage() == 3)  // headless: the DMCUB the firmware started keeps running, nobody touches it
++		LOG("smu_hw_init: stage 3, DMUB poller not started");
++	else
++		dmubPollerStart();
+ 
+ 	auto table = reinterpret_cast<Fn6 *>(out + 0x8);  // smu_hw_init fills out+0x8..0xa8
+ 	for (size_t i = 0; i < OpCount; i++)
+@@ -176,6 +187,28 @@ void smuExitReset(const char *tag) {
+ 	    mmioRead(0x1260 + 0x0da4), mmioRead(0x1260 + 0x0f48), mmioRead(RegResp));
+ }
+ 
++// Stage 3 preflight: did the PMFW answer GetSmuVersion at this boot?
++bool smuPmfwOk() { return gPmfwResp == 1 && gPmfwVersion && gPmfwVersion != 0xFFFFFFFF; }
++
++// Stage 3, right after the preflight passed and before Apple's ttl_hw_init: what smu_sw_init does at
++// stage 0. The engine halt as upstream (-rmbnohalt skips it); the MODE2 reset only with -rmbmode2
++// (sendMsg refuses it otherwise): on a cold bare-metal boot nothing of ours ran before, and
++// upstream's own bare-metal configuration boots with -rmbnomode2.
++void smuStage3BeforeHwInit() {
++	constexpr uint32_t GrbmStatus = 0x1260 + 0x0da4, MecIp = 0x1260 + 0x0f48;
++	LOG("stage 3: before hw init: GRBM_STATUS %x MEC1 IP %x", mmioRead(GrbmStatus), mmioRead(MecIp));
++	if (!checkKernelArgument("-rmbnohalt"))
++		haltGfxEngines("before hw init");
++	if (!checkKernelArgument("-rmbmode2")) {
++		LOG("stage 3: MODE2 reset not sent (needs -rmbmode2)");
++		return;
++	}
++	uint32_t arg = 2;  // SMU_RESET_MODE_2
++	auto resp = sendMsg(PPSMC_MSG_GfxDeviceDriverReset, arg, 5000);
++	IOSleep(100);
++	LOG("stage 3: MODE2 reset resp %u; GRBM_STATUS %x MEC1 IP %x", resp, mmioRead(GrbmStatus), mmioRead(MecIp));
++}
++
+ void smuRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	KernelPatcher::RouteRequest requests[] {
+ 		{"_smu_sw_init", smuSwInit},
+-- 
+2.39.5 (Apple Git-154)
+

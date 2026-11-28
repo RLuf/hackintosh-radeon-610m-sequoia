@@ -1,0 +1,710 @@
+From da54e5d49881b3bd54e51810211c7b1fe8dacc7b Mon Sep 17 00:00:00 2001
+From: fzmac porte <noreply@example.invalid>
+Date: Thu, 19 Nov 2026 20:52:55 +0000
+Subject: [PATCH 02/48] =?UTF-8?q?feat:=20M2=20do=20porte=20610M=20-=20est?=
+ =?UTF-8?q?=C3=A1gios=20(rmbstage),=20identidade=20e=20VBIOS=20da=201002:1?=
+ =?UTF-8?q?506?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Marco M2 do mapa de porte (docs/PORTING-MAP-610m.md do fzmacscript):
+identidade PCI e de IP, caminho de inicialização de software dos kexts
+da Apple e a BIOS de vídeo, ainda sem inicializar hardware.
+
+Estágios (rmb.hpp, rmbStage() em ipdisc.cpp), no lugar de mais flags:
+- rmbstage=1 (padrão, e qualquer valor desconhecido): o M1. Nenhum
+  kext alterado; única escrita em hardware = par MM_INDEX/MM_INDEX_HI
+  do ipdisc.cpp, salvo e restaurado.
+- rmbstage=2: o estágio 1 mais
+  * IOPCIFamily: ganchos de identidade (1506 -> 73ff);
+  * HWLibs: os ganchos de identidade/versão de IP e de rastreio do
+    upstream, o SMU substituto e, no lugar dos rastreios de
+    ttl_hw_init e psp_hw_init, bloqueios que devolvem 1 sem executar o
+    código da Apple. Ficam fora os ganchos de firmware (firmware.cpp),
+    de golden settings, psp_ring_create, psp_power_up_event e
+    vbs_hw_init;
+  * Framebuffer: sempre sem tela (AmdRadeonFramebuffer::start
+    recusado), identidade (populateDeviceInfo/XGmiConfig), rastreios,
+    contagem de pipes, e os seis ganchos de acesso a registro em modo
+    de descarte: leituras como no upstream (remapeadas e sem tocar nos
+    buracos do PHY), toda escrita e toda tabela ATOM descartada e
+    contada. Se algum dos seis não puder ser instalado, o start do
+    AmdRadeonController é recusado;
+  * nada para o acelerador, AppleBacklight, AGDC, AppleUSBXHCI, NVAccel.
+  Escritas do plugin no estágio 2: o par MM_INDEX do estágio 1 e as
+  três escritas de uma consulta GetSmuVersion (0x02) na caixa do PMFW;
+  mmioWrite descarta e registra qualquer outra, sendMsg recusa qualquer
+  outra mensagem, smu_hw_init devolve erro.
+- -rmbnoprobe (sem -rmbprobe) continua sendo o único caminho para o
+  driver completo do upstream.
+
+Outras mudanças do M2:
+- S09: gc_get_hw_version apresenta também 0xa0307 (GC 10.3.7 da 610M)
+  como 10.3.4; 0xa0303 continua valendo.
+- S02: novo -rmbrevc7 (desligado por padrão) apresenta a revisão PCI C1
+  da 1002:1506 como C7, para o caso de a linha C1 não existir na tabela
+  de capacidades.
+- S03: tests/pci-identity.cpp cobre a 1002:1506 rev. C1 (ID trocado,
+  revisão mantida; C7 só com -rmbrevc7).
+- S82: scripts/vfct-rom.py escolhe a imagem pelo ID (680M 0x1681 ou
+  610M 0x1506, ou --device) e nomeia os arquivos de acordo; confere o
+  PCIR contra o cabeçalho da VFCT. Para a 680M a saída é idêntica à do
+  script anterior.
+- S43/S86: scripts/augment-rom.py não dependia do chip; ganhou a
+  conferência do tamanho da tabela mestra e a nota sobre --vram-mb
+  (2048 na 82X5). Saída idêntica à anterior para a mesma entrada.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSn5SmsfPKALaTRZ7W5
+---
+ README.md                               |   2 +
+ scripts/augment-rom.py                  |   9 +-
+ scripts/vfct-rom.py                     |  43 ++++++---
+ src/RembrandtGfx/display.cpp            |  43 +++++++++
+ src/RembrandtGfx/ipdisc.cpp             |  29 ++++--
+ src/RembrandtGfx/kern_start.cpp         | 112 ++++++++++++++++++------
+ src/RembrandtGfx/mmio.cpp               |  18 +++-
+ src/RembrandtGfx/rmb.hpp                |  17 +++-
+ src/RembrandtGfx/smu.cpp                |  12 +++
+ src/RembrandtGfx/tests/pci-identity.cpp |  20 +++++
+ 10 files changed, 248 insertions(+), 57 deletions(-)
+
+diff --git a/README.md b/README.md
+index 21036fe..0c2c759 100644
+--- a/README.md
++++ b/README.md
+@@ -109,6 +109,8 @@ Xcode `MacOSX.sdk` (`SDK=...`).
+    `/sys/firmware/acpi/tables/VFCT`, then `python3 scripts/vfct-rom.py VFCT` and
+    `python3 scripts/augment-rom.py roms/680m-73ff.rom roms/680m-73ff-aug.rom`. Add it as data under the
+    GPU's `DeviceProperties` (`PciRoot(0x0)/Pci(0x8,0x1)/Pci(0x0,0x0)` here), next to `device-id` `ff730000`.
++   On a Radeon 610M (1002:1506) `vfct-rom.py` writes `roms/610m.rom` and `roms/610m-73ff.rom` instead;
++   pass the machine's UMA size to `augment-rom.py`, e.g. `--vram-mb 2048`.
+ 4. Generate your own SMBIOS (MacPro7,1) for the `CHANGE-ME` fields.
+ 5. Copy to the ESP (`scripts/install-oc-bm.sh`, set `ESP_DISK`/`ESP_PART`).
+ 
+diff --git a/scripts/augment-rom.py b/scripts/augment-rom.py
+index 8325c39..7713829 100644
+--- a/scripts/augment-rom.py
++++ b/scripts/augment-rom.py
+@@ -5,13 +5,16 @@
+ 
+ AMDRadeonX6000Framebuffer's AmdAtomFwServices::initializeAtomDataTable() asserts that the
+ master data table has a PSP directory (slot sw_datatable9, +0x16) and vram_info (+0x3C).
+-Rembrandt's VBIOS has neither. We append:
++Rembrandt's (680M) and Mendocino's (610M) VBIOS have neither. We append:
+   - PSP directory v2.1: '$PSP' header with 0 entries, padded to the 0x414 bytes the driver
+     maps (64 entries). The parser loops over the entry count, so 0 entries parses cleanly.
+   - vram_info v2.6 (atom_vram_info_header_v2_6 from Linux atomfirmware.h), one
+     atom_vram_module_v9 marked GDDR6 (0x70; the driver maps 0x50/0x60/0x70 only), padded
+     to the 0x358 bytes the driver maps (16 modules).
+ Then grow the image length (byte 2 and PCIR), and fix the ATOM checksum byte (0x21).
++
++Nothing here depends on the chip. --vram-mb is the UMA carve-out the firmware reserves:
++3072 on the 680M this was written for (the default), 2048 on the IdeaPad 82X5's 610M.
+ """
+ import argparse, struct
+ 
+@@ -61,6 +64,10 @@ def main():
+     mdt = struct.unpack_from('<H', rom, romhdr + 0x20)[0]
+     pcir = struct.unpack_from('<H', rom, 0x18)[0]
+     assert rom[pcir:pcir + 4] == b'PCIR' and rom[pcir + 0x15] & 0x80, 'expects a single-image ROM'
++    mdt_size = struct.unpack_from('<H', rom, mdt)[0]
++    assert max(PSP_SLOT, VRAM_SLOT) + 2 <= mdt_size, 'master data table too short for these slots'
++    print('PCIR %04x:%04x, %#x bytes, master data table @%#x (%#x bytes)'
++          % (struct.unpack_from('<HH', rom, pcir + 4) + (len(rom), mdt, mdt_size)))
+ 
+     for slot, blob in ((PSP_SLOT, psp_directory()), (VRAM_SLOT, vram_info(a.vram_mb, a.bus_width))):
+         if struct.unpack_from('<H', rom, mdt + slot)[0]:
+diff --git a/scripts/vfct-rom.py b/scripts/vfct-rom.py
+index 6eca3bf..05870e2 100644
+--- a/scripts/vfct-rom.py
++++ b/scripts/vfct-rom.py
+@@ -1,10 +1,22 @@
+-"""Extract the Radeon 680M VBIOS from a copy of the ACPI VFCT table and write two romfiles:
+-  roms/680m.rom         - as-is (PCI device id 0x1681)
+-  roms/680m-73ff.rom    - PCIR device id patched to 0x73FF (Navi 23) with the ATOM checksum fixed
+-Usage: python3 -I scripts/vfct-rom.py roms/VFCT.bin"""
+-import struct, sys
++"""Extract the APU's VBIOS from a copy of the ACPI VFCT table and write two romfiles:
++  roms/<name>.rom         - as-is (680M: PCI device id 0x1681, 610M: 0x1506)
++  roms/<name>-73ff.rom    - PCIR device id patched to 0x73FF (Navi 23) with the ATOM checksum fixed
++<name> is 680m or 610m, taken from the device id of the first AMD image in the table.
++Usage: python3 -I scripts/vfct-rom.py roms/VFCT.bin [--device 0x1506] [--name 610m] [--outdir roms]
++  --device  take the image with this PCI device id instead of the first known one
++  --name    file name stem (default: 680m / 610m, or the device id in hex)"""
++import argparse, os, struct, sys
+ 
+-data = open(sys.argv[1], "rb").read()
++KNOWN = {0x1681: "680m", 0x1506: "610m"}  # Rembrandt Radeon 680M, Mendocino Radeon 610M
++
++ap = argparse.ArgumentParser()
++ap.add_argument("vfct")
++ap.add_argument("--device", type=lambda s: int(s, 0))
++ap.add_argument("--name")
++ap.add_argument("--outdir", default="roms")
++a = ap.parse_args()
++
++data = open(a.vfct, "rb").read()
+ sig, length = struct.unpack_from("<4sI", data, 0)
+ assert sig == b"VFCT", sig
+ vbios_off, = struct.unpack_from("<I", data, 36 + 16)
+@@ -14,19 +26,26 @@ while off + 28 <= length:
+     print("VFCT image: %02x:%02x.%x %04x:%04x subsys %04x:%04x len %d" % (bus, dev, fn, ven, did, ssv, ssid, ilen))
+     img = bytearray(data[off + 28:off + 28 + ilen])
+     off += 28 + ilen
+-    if (ven, did) != (0x1002, 0x1681) or not ilen:
++    if ven != 0x1002 or not ilen or (did != a.device if a.device is not None else did not in KNOWN):
+         continue
++    assert len(img) == ilen, "VFCT image is truncated"
+     assert img[:2] == b"\x55\xaa", "no option-ROM signature"
+-    open("roms/680m.rom", "wb").write(img)
++    name = a.name or KNOWN.get(did, "%04x" % did)
++    os.makedirs(a.outdir, exist_ok=True)
++    asis, patched = os.path.join(a.outdir, name + ".rom"), os.path.join(a.outdir, name + "-73ff.rom")
++    open(asis, "wb").write(img)
+     pcir, = struct.unpack_from("<H", img, 0x18)
+     assert img[pcir:pcir + 4] == b"PCIR"
+-    print("PCIR @%#x vendor %04x device %04x" % ((pcir,) + struct.unpack_from("<HH", img, pcir + 4)))
++    pven, pdid = struct.unpack_from("<HH", img, pcir + 4)
++    print("PCIR @%#x vendor %04x device %04x" % (pcir, pven, pdid))
++    assert (pven, pdid) == (ven, did), "PCIR id differs from the VFCT image header"
+     struct.pack_into("<H", img, pcir + 6, 0x73FF)
+     size = img[2] * 512  # legacy image length; ATOM checksum byte at 0x21 makes this range sum to 0
+     img[0x21] = (img[0x21] - sum(img[:size])) & 0xFF
+     assert sum(img[:size]) & 0xFF == 0
+-    open("roms/680m-73ff.rom", "wb").write(img)
+-    print("wrote roms/680m.rom and roms/680m-73ff.rom (%d bytes, legacy image %d)" % (len(img), size))
++    open(patched, "wb").write(img)
++    print("wrote %s and %s (%d bytes, legacy image %d)" % (asis, patched, len(img), size))
+     break
+ else:
+-    sys.exit("680M (1002:1681) image not found in VFCT")
++    sys.exit("no image for %s found in VFCT" % ("1002:%04x" % a.device if a.device is not None else
++                                               "a known APU (" + ", ".join("1002:%04x" % d for d in KNOWN) + ")"))
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 8768e90..5a60ed9 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -1558,8 +1558,22 @@ void checkDmubStall() {
+ 				LOG("stall:   phy %x = %x", r, mmioRead(r));
+ }
+ 
++// Stage 2 (rmbstage=2): Apple's framebuffer may read registers (remapped and PHY-hole-guarded as
++// always), but nothing it writes through these hooks reaches the hardware: DAL writes, raw
++// AmdRegisterAccess writes and VBIOS command tables are dropped and counted here.
++bool stage2Dropped(const char *what, uint32_t a, uint32_t b) {
++	if (rmbStage() != 2)
++		return false;
++	static uint32_t n;
++	if (n++ < 40 || n % 1000 == 0)
++		LOG("stage 2: dropped %s %x = %x (#%u)", what, a, b, n);
++	return true;
++}
++
+ uint64_t wrapWrite(uint64_t helper, uint64_t reg, uint64_t val, uint64_t d, uint64_t e, uint64_t f) {
+ 	uint32_t r = reg & 0xFFFFFFFF;
++	if (stage2Dropped("DAL write", r, val & 0xFFFFFFFF))
++		return 0;
+ 	eoi0Note(r | 0x40000000, val & 0xFFFFFFFF);  // bit 30 = DAL write
+ 	if (r >= PgFirst && r <= PgLast) {
+ 		gPgShadow[r - PgFirst] = val & 0xFFFFFFFF;
+@@ -1733,6 +1747,8 @@ uint64_t wrapRawRead(uint64_t self, uint64_t reg) {
+ 
+ uint64_t wrapRawWrite(uint64_t self, uint64_t reg, uint64_t val) {
+ 	uint32_t r = reg & 0xFFFFFFFF;
++	if (stage2Dropped("raw write", r, val & 0xFFFFFFFF))  // every register, display or not
++		return 0;
+ 	eoi0Note(r, val & 0xFFFFFFFF);
+ 	if (gDalThread == current_thread() || !isDisplayReg(r))
+ 		return reinterpret_cast<uint64_t (*)(uint64_t, uint64_t, uint64_t)>(orgRawWrite)(self, reg, val);
+@@ -1762,6 +1778,8 @@ uint64_t wrapExecTable(uint64_t helper, uint64_t index, uint64_t params, uint64_
+ 	auto p = reinterpret_cast<const uint8_t *>(params);
+ 	uint32_t p0 = p ? *reinterpret_cast<const uint32_t *>(p) : 0, p1 = p ? *reinterpret_cast<const uint32_t *>(p + 4) : 0,
+ 			 p2 = p ? *reinterpret_cast<const uint32_t *>(p + 8) : 0;
++	if (stage2Dropped("ATOM table", idx, p0))
++		return 1;  // reported as done, like the skipped INIT below
+ 	if (!gKeepTxInit && idx == Dig1TransmitterControl && p && p[1] == TxActionInit) {
+ 		LOG("atom: skipped table %u (DIG1TransmitterControl INIT) params %08x %08x %08x, PHY %x", idx, p0, p1, p2, phyPeek());
+ 		return 1;
+@@ -3171,6 +3189,31 @@ bool rmbVerbose() {
+ 	return on;
+ }
+ 
++// Stage 2: only the register access hooks, and they drop every write (stage2Dropped). No watchdog
++// or poller thread, no early open, no backlight or presenter hook. Write hooks first; false unless
++// all six are in place, and then the caller must not let the controller start.
++bool displayRouteStage2(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
++	KernelPatcher::RouteRequest reqs[] {
++		{"__ZN27AMDRadeonX6000_AmdDalHelper22dalAtomWriteRegister32EPvjj", wrapWrite, orgWrite},
++		{"__ZN32AMDRadeonX6000_AmdRegisterAccess10writeReg32Ejj", wrapRawWrite, orgRawWrite},
++		{"__ZN27AMDRadeonX6000_AmdDalHelper19dalAtomExecCmdTableEPvjS0_", wrapExecTable, orgExecTable},
++		{"__ZN27AMDRadeonX6000_AmdDalHelper21dalAtomReadRegister32EPvj", wrapRead, orgRead},
++		{"__ZN32AMDRadeonX6000_AmdRegisterAccess11hwReadReg32Ej", wrapRawRead<orgHwRead>, orgHwRead},
++		{"__ZN32AMDRadeonX6000_AmdRegisterAccess17readValidateReg32Ej", wrapRawRead<orgValRead>, orgValRead},
++	};
++	gFbText = address;
++	size_t routed = 0;
++	for (auto &r : reqs) {
++		if (patcher.routeMultiple(index, &r, 1, address, size))
++			routed++;
++		else
++			LOG("stage 2: failed to route %s (err %d)", r.symbol, static_cast<int>(patcher.getError()));
++		patcher.clearError();
++	}
++	LOG("stage 2: %zu of %zu framebuffer register hooks installed; writes and ATOM tables are dropped", routed, arrsize(reqs));
++	return routed == arrsize(reqs);
++}
++
+ void displayRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	gKeepPwrGate = checkKernelArgument("-rmbpwrgate");
+ 	gNoFwBl = checkKernelArgument("-rmbnofwbl");
+diff --git a/src/RembrandtGfx/ipdisc.cpp b/src/RembrandtGfx/ipdisc.cpp
+index 14942ea..54387ea 100644
+--- a/src/RembrandtGfx/ipdisc.cpp
++++ b/src/RembrandtGfx/ipdisc.cpp
+@@ -47,15 +47,24 @@
+ #include <kern/thread.h>
+ #include <libkern/c++/OSData.h>
+ 
+-// -rmbprobe: bring-up mode, ON by default in this port. -rmbnoprobe turns it off (full driver, as
+-// upstream); if both are given, -rmbprobe wins.
+-bool rmbProbe() {
+-	static int on = -1;
+-	if (on < 0)
+-		on = checkKernelArgument("-rmbprobe") || !checkKernelArgument("-rmbnoprobe");
+-	return on;
++// Bring-up stage of the 610M port (see rmb.hpp). 0 = full driver as upstream, only with -rmbnoprobe
++// and without -rmbprobe (-rmbprobe wins if both are given). Otherwise rmbstage=N: 1 (default, and
++// the fallback for any other value) or 2.
++uint32_t rmbStage() {
++	static int stage = -1;
++	if (stage < 0) {
++		uint32_t n = 1;
++		if (!checkKernelArgument("-rmbprobe") && checkKernelArgument("-rmbnoprobe"))
++			n = 0;
++		else if (!lilu_get_boot_args("rmbstage", &n, sizeof(n)) || n != 2)
++			n = 1;
++		stage = static_cast<int>(n);
++	}
++	return static_cast<uint32_t>(stage);
+ }
+ 
++bool rmbProbe() { return rmbStage() != 0; }
++
+ namespace {
+ 
+ constexpr uint32_t RegMemSize = 0xde3, RegFbOffset = 0x1260 + 0x16e7;      // dword indices, read only
+@@ -265,9 +274,11 @@ void probe(IOService *svc, bool retry) {
+ 		return;
+ 	}
+ 	if (!mem) {
+-		LOG("probe: memory decode is off, registers not touched%s", retry ? "" : "; one retry in 20 s");
++		// The retry is for stage 1 only: at stage 2 Apple's kexts own MM_INDEX by then.
++		bool again = !retry && rmbStage() == 1;
++		LOG("probe: memory decode is off, registers not touched%s", again ? "; one retry in 20 s" : "");
+ 		thread_t t;
+-		if (retry)
++		if (!again)
+ 			return;
+ 		svc->retain();
+ 		if (kernel_thread_start(retryThread, svc, &t) == KERN_SUCCESS)
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 8df7659..7c860bf 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -174,6 +174,11 @@ static uint64_t wrapFbStart(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, ui
+ 	LOG("headless: AmdRadeonFramebuffer start declined");
+ 	return 0;
+ }
++// Stage 2 fallback, used only when the write-blocking register hooks could not all be installed.
++static uint64_t wrapCtrlStartDeclined(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
++	LOG("stage 2: AmdRadeonController start declined (register hooks missing)");
++	return 0;
++}
+ 
+ // AmdAsicInfoNavi2::populateDeviceInfo takes device id (bits 15:0) and revision (27:24) from
+ // mmRCC_DEV0_EPF0_STRAP0 = 0xd31, an NBIO 2.3 (Navi) offset; on Rembrandt (NBIO 7.2) that is a
+@@ -459,11 +464,19 @@ static void safeModes(KernelPatcher &patcher, size_t index, mach_vm_address_t ad
+ }
+ 
+ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+-	capHdmiPixelClock(address, size);
++	// Stage 2: headless always; of the code patches only the pipe count (DAL builds its resource pool
++	// in software); register hooks in write-dropping mode; no IH, mode or display hooks.
++	bool s2 = rmbStage() == 2, s2WritesBlocked = false;
++	if (!s2)
++		capHdmiPixelClock(address, size);
+ 	capPipes(address, size);
+-	ihMmioWptr(patcher, address, size);
+-	safeModes(patcher, index, address, size);
+-	gHeadless = checkKernelArgument("-rmbheadless");
++	if (!s2) {
++		ihMmioWptr(patcher, address, size);
++		safeModes(patcher, index, address, size);
++	} else {
++		s2WritesBlocked = displayRouteStage2(patcher, index, address, size);
++	}
++	gHeadless = s2 || checkKernelArgument("-rmbheadless");
+ 	if (gHeadless) {
+ 		KernelPatcher::RouteRequest req {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer5startEP9IOService", wrapFbStart};
+ 		if (!patcher.routeMultiple(index, &req, 1, address, size))
+@@ -473,7 +486,7 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 		patcher.clearError();
+ 	}
+ 	KernelPatcher::RouteRequest traces[] {
+-		{"__ZN34AMDRadeonX6000_AmdRadeonController5startEP9IOService", wrap_CtrlStart, org_CtrlStart},
++		{"__ZN34AMDRadeonX6000_AmdRadeonController5startEP9IOService", s2 && !s2WritesBlocked ? wrapCtrlStartDeclined : wrap_CtrlStart, org_CtrlStart},
+ 		{"__ZN34AMDRadeonX6000_AmdRadeonController19initializeInternalsEP9IOService", wrap_CtrlInitInternals, org_CtrlInitInternals},
+ 		{"__ZN34AMDRadeonX6000_AmdRadeonController7powerUpEv", wrap_CtrlPowerUp, org_CtrlPowerUp},
+ 		{"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer16enableControllerEv", wrap_FbEnableController, org_FbEnableController},
+@@ -483,7 +496,8 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 		{"__ZN31AMDRadeonX6000_AmdAsicInfoNavi218populateXGmiConfigEv", wrapPopulateXGmiConfig, orgPopulateXGmiConfig},
+ 		{"__ZN29AMDRadeonX6000_AmdGpuWrangler24vendor_doDeviceAttributeEjPmmS0_S0_P25IOExternalMethodArguments", wrapVendorAttr, orgVendorAttr},
+ 	};
+-	displayRoute(patcher, index, address, size);
++	if (!s2)
++		displayRoute(patcher, index, address, size);
+ 	for (auto &r : traces) {
+ 		if (!patcher.routeMultiple(index, &r, 1, address, size))
+ 			LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
+@@ -546,8 +560,8 @@ static uint64_t wrap_psp_asic_type_init(uint64_t psp, uint64_t info, uint64_t c,
+ 	return r;
+ }
+ 
+-// HWLibs has GC tables for 10.3.0 (Navi 21) and 10.3.4 (Navi 23) only. Rembrandt's GC is 10.3.3,
+-// the same gfx10.3 design (Linux drives both with gfx_v10_0); present it as 10.3.4. Firmware and
++// HWLibs has GC tables for 10.3.0 (Navi 21) and 10.3.4 (Navi 23) only. Rembrandt's GC is 10.3.3
++// and Mendocino's 10.3.7, the same gfx10.3 design (Linux drives all with gfx_v10_0); present them as 10.3.4. Firmware and
+ // golden settings that differ are substituted separately.
+ static mach_vm_address_t org_gc_get_hw_version;
+ static uint64_t wrap_gc_get_hw_version(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+@@ -555,9 +569,9 @@ static uint64_t wrap_gc_get_hw_version(uint64_t a, uint64_t b, uint64_t c, uint6
+ 	static bool logged;
+ 	if (!logged) {
+ 		logged = true;
+-		LOG("gc_get_hw_version: GC %llx%s", v, v == 0xa0303 ? ", presenting as 10.3.4" : "");
++		LOG("gc_get_hw_version: GC %llx%s", v, v == 0xa0303 || v == 0xa0307 ? ", presenting as 10.3.4" : "");
+ 	}
+-	return v == 0xa0303 ? 0xa0304 : v;
++	return v == 0xa0303 || v == 0xa0307 ? 0xa0304 : v;  // 680M = 10.3.3, 610M = 10.3.7
+ }
+ 
+ // PSP mailbox dump around KM ring creation (MP0 seg0 0x16000; C2PMSG_n = 0x40 + n).
+@@ -687,10 +701,32 @@ static uint64_t wrap_gc_10_3_initialize_registers(uint64_t a, uint64_t b, uint64
+ 	return r;
+ }
+ 
++// Stage 2 (rmbstage=2): the hardware-init entry points fail before any of Apple's code runs. In this
++// family 0 is success (our own smu_sw_init / smu_hw_init replacements return 0, psp_tmr_init's caller
++// treats nonzero as failure, firmware.cpp) and upstream saw ttl_initialize = 1 for a rejected device.
++#define BLOCK_HOOK(name)                                                                       \
++	static uint64_t block_##name(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {   \
++		LOG("stage 2: " #name " BLOCKED, returning 1 without running Apple's code");           \
++		return 1;                                                                              \
++	}
++BLOCK_HOOK(ttl_hw_init)
++BLOCK_HOOK(psp_hw_init)
++
++// Hooks that only matter once hardware init runs; stage 2 does not install them.
++static bool stage2Skips(const char *symbol) {
++	static const char *const skip[] {"_execute_register_golden_settings", "_gc_10_3_initialize_registers",
++		"_psp_ring_create", "_psp_power_up_event", "_vbs_hw_init"};
++	for (auto s : skip)
++		if (!strcmp(symbol, s))
++			return true;
++	return false;
++}
++
+ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
++	bool s2 = rmbStage() == 2;
+ 	KernelPatcher::RouteRequest requests[] {
+ 		{"_ttl_sw_init", wrap_ttl_sw_init, org_ttl_sw_init},
+-		{"_ttl_hw_init", wrap_ttl_hw_init, org_ttl_hw_init},
++		{"_ttl_hw_init", s2 ? block_ttl_hw_init : wrap_ttl_hw_init, org_ttl_hw_init},
+ 		{"_IpiSwInit", wrap_IpiSwInit, org_IpiSwInit},
+ 		{"_IpiHwInit", wrap_IpiHwInit, org_IpiHwInit},
+ 		{"_TlsSwInit", wrap_TlsSwInit, org_TlsSwInit},
+@@ -722,7 +758,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"_gc_set_fw_entry_info", wrap_gc_set_fw_entry_info, org_gc_set_fw_entry_info},
+ 		{"_gc_init_fcn_ptr_list", wrap_gc_init_fcn_ptr_list, org_gc_init_fcn_ptr_list},
+ 		{"_gc_validate_hw_config_tbl_version", wrap_gc_validate_hw_config_tbl_version, org_gc_validate_hw_config_tbl_version},
+-		{"_psp_hw_init", wrap_psp_hw_init, org_psp_hw_init},
++		{"_psp_hw_init", s2 ? block_psp_hw_init : wrap_psp_hw_init, org_psp_hw_init},
+ 		{"_psp_init_pfn_ptr", wrap_psp_init_pfn_ptr, org_psp_init_pfn_ptr},
+ 		{"_ttlDevCreateInstance", wrap_ttlDevCreateInstance, org_ttlDevCreateInstance},
+ 		{"_ttl_cgs_initialize", wrap_ttl_cgs_initialize, org_ttl_cgs_initialize},
+@@ -746,6 +782,8 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"__ZN14AmdTtlServices13initializePrmEv", wrap_TtlInitializePrm, org_TtlInitializePrm},
+ 	};
+ 	for (auto &r : requests) {
++		if (s2 && stage2Skips(r.symbol))
++			continue;
+ 		if (!patcher.routeMultiple(index, &r, 1, address, size))
+ 			LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
+ 		patcher.clearError();
+@@ -758,7 +796,10 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		gTolerateTasks[0] = patcher.solveSymbol(index, "_PEM_Task_NotifyHWOfPowerSource");
+ 	patcher.clearError();
+ 	smuRoute(patcher, index, address, size);
+-	firmwareRoute(patcher, index, address, size);
++	if (s2)
++		LOG("stage 2: ttl_hw_init and psp_hw_init blocked, firmware and golden hooks not installed");
++	else
++		firmwareRoute(patcher, index, address, size);
+ 	LOG("HWLibs hooks installed");
+ }
+ 
+@@ -838,23 +879,27 @@ static bool kinfoReady(size_t i) {
+ }
+ 
+ static void scanKmods() {
+-	if (!gKmods || rmbProbe())  // probe mode: no kext is hooked or patched
++	// Stage 1: no kext is hooked or patched. Stage 2: IOPCIFamily, HWLibs and the framebuffer only
++	// (not the accelerator, AppleBacklight, AGDC, AppleUSBXHCI or NVAccel). Stage 0: everything.
++	uint32_t stage = rmbStage();
++	if (!gKmods || stage == 1)
+ 		return;
++	bool full = stage == 0;
+ 	static bool agdcFound, xhciFound, nvFound;
+ 	for (auto kmod = *gKmods; kmod; kmod = kmod->next) {
+-		if (!agdcFound && !strncmp(kmod->name, "com.apple.AppleGraphicsDeviceControl", KMOD_MAX_NAME)) {
++		if (full && !agdcFound && !strncmp(kmod->name, "com.apple.AppleGraphicsDeviceControl", KMOD_MAX_NAME)) {
+ 			agdcFound = true;
+ 			displaySetAgdcBase(kmod->address);
+ 		}
+-		if (!xhciFound && !strncmp(kmod->name, "com.apple.driver.usb.AppleUSBXHCI", KMOD_MAX_NAME)) {
++		if (full && !xhciFound && !strncmp(kmod->name, "com.apple.driver.usb.AppleUSBXHCI", KMOD_MAX_NAME)) {
+ 			xhciFound = true;
+ 			xhciPrimaryInterrupter(kmod->address, kmod->size);
+ 		}
+-		if (!nvFound && !strncmp(kmod->name, "com.nullmoth.NVAccel", KMOD_MAX_NAME)) {
++		if (full && !nvFound && !strncmp(kmod->name, "com.nullmoth.NVAccel", KMOD_MAX_NAME)) {
+ 			nvFound = true;
+ 			nvCopyPatch(kmod->address, kmod->size);
+ 		}
+-		for (size_t i = 0; i < 3; i++) {  // 0 = HWLibs, 1 = Framebuffer, 2 = Accelerator
++		for (size_t i = 0; i < (full ? 3 : 2); i++) {  // 0 = HWLibs, 1 = Framebuffer, 2 = Accelerator
+ 			if (hooked[i] || strncmp(kmod->name, kexts[i].id, KMOD_MAX_NAME) || !kinfoReady(i))
+ 				continue;
+ 			hooked[i] = true;
+@@ -869,7 +914,7 @@ static void scanKmods() {
+ 				probeRouteAccel(*gPatcher, kexts[i].loadIndex, kmod->address, size);
+ 		}
+ 		auto &bl = kexts[BacklightIdx];
+-		if (!hooked[BacklightIdx] && !strncmp(kmod->name, bl.id, KMOD_MAX_NAME) && kinfoReady(BacklightIdx)) {
++		if (full && !hooked[BacklightIdx] && !strncmp(kmod->name, bl.id, KMOD_MAX_NAME) && kinfoReady(BacklightIdx)) {
+ 			hooked[BacklightIdx] = true;
+ 			auto size = gPatcher->updateRunningInfo(bl.loadIndex, kmod->address, kmod->size);
+ 			LOG("found %s, size %zx", bl.id, size);
+@@ -891,18 +936,22 @@ static void scanKmods() {
+ // "Failed to send PPLIB IRI to Accelerator" panic). Report 73ff like the VM did.
+ static mach_vm_address_t orgPciRead8, orgPciRead16, orgPciRead32;
+ static bool gDevidLogged, gRevisionLogged;
++// -rmbrevc7: also present the 610M's PCI revision C1 as C7. Off by default: C1 is expected to be a
++// row of Navi 23's table already (RX 6600 XT). For when ttlSetDeviceCapabilityEntry returns 0.
++static bool gRevC1ToC7;
+ 
+ // 24H32's TTL checks both device ID and PCI revision before software init. This RedmiBook
+ // reports revision 02, absent from Navi 23's table; its c7 row has the same capability payload
+ // as the other Navi 23 rows. Keep the existing identity consistent across config-read widths.
+ static uint32_t rembrandtPciRevision(void *dev, uint64_t off, uint32_t value) {
+-	if (off != kIOPCIConfigRevisionID || (value & 0xFF) != 0x02)
++	uint32_t rev = value & 0xFF;
++	if (off != kIOPCIConfigRevisionID || (rev != 0x02 && !(rev == 0xC1 && gRevC1ToC7)))
+ 		return value;
+ 	auto read16 = reinterpret_cast<uint16_t (*)(void *, uint64_t)>(orgPciRead16);
+ 	if (read16(dev, kIOPCIConfigVendorID) != 0x1002 || read16(dev, kIOPCIConfigDeviceID) != 0x1506)
+ 		return value;
+ 	if (!gRevisionLogged)
+-		gRevisionLogged = true, LOG("pcidevid: PCI revision 02 -> c7");
++		gRevisionLogged = true, LOG("pcidevid: PCI revision %02x -> c7", rev);
+ 	return (value & ~0xFFU) | 0xC7;
+ }
+ 
+@@ -936,6 +985,7 @@ static void routePciDevid(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		LOG("pcidevid: disabled (-rmbnopcidevid)");
+ 		return;
+ 	}
++	gRevC1ToC7 = checkKernelArgument("-rmbrevc7");
+ 	KernelPatcher::RouteRequest reqs[] {
+ 		{"__ZN11IOPCIDevice20extendedConfigRead16Ey", wrapPciRead16, orgPciRead16},
+ 		{"__ZN11IOPCIDevice20extendedConfigRead32Ey", wrapPciRead32, orgPciRead32},
+@@ -954,22 +1004,28 @@ static OSReturn wrapOSKextStart(void *kext, bool startDependencies) {
+ }
+ 
+ static void pluginStart() {
+-	// 610M port: probe mode (rmb.hpp) is on unless -rmbnoprobe. It keeps the PCI publish notifier (for
+-	// the ipdisc.cpp probe) and the disk log; every code patch and every hardware write is skipped,
+-	// except ipdisc.cpp's MM_INDEX / MM_INDEX_HI pair (saved and restored).
+-	bool probe = rmbProbe();
+-	LOG("starting%s", probe ? " in PROBE mode: no kext hooks, only MM_INDEX/MM_INDEX_HI written and restored (-rmbnoprobe = full driver)" : "");
++	// 610M port: staged bring-up (rmb.hpp). Stage 1 keeps the PCI publish notifier (for the ipdisc.cpp
++	// probe) and the disk log; every code patch and every hardware write is skipped, except
++	// ipdisc.cpp's MM_INDEX / MM_INDEX_HI pair (saved and restored). Stage 2 adds the identity and
++	// software-init hooks (scanKmods) and one GetSmuVersion query.
++	uint32_t stage = rmbStage();
++	if (stage == 1)
++		LOG("starting at stage 1: no kext hooks, only MM_INDEX/MM_INDEX_HI written and restored (rmbstage=2 = identity + software init, -rmbnoprobe = full driver)");
++	else if (stage == 2)
++		LOG("starting at stage 2: identity + software init hooks, hardware init blocked, writes: MM_INDEX pair + one GetSmuVersion (-rmbnoprobe = full driver)");
++	else
++		LOG("starting");
+ 	ihQuiesceAtBoot();
+ 	usb4SleepStart();
+ 	// Registering the kexts makes Lilu build their symbol tables (kinfos) for us.
+-	if (!probe)
++	if (stage != 1)
+ 		lilu.onKextLoadForce(kexts, arrsize(kexts));
+ 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
+ 		gPatcher = &patcher;
+ 		gKmods = reinterpret_cast<kmod_info_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_kmod"));
+ 		LOG("patcher ready, kmod list %s, hwlibs kinfo %zu", gKmods ? "found" : "missing", kextHWLibs.loadIndex);
+ 		KernelPatcher::RouteRequest req {"__ZN6OSKext5startEb", wrapOSKextStart, orgOSKextStart};
+-		if (rmbProbe())
++		if (rmbStage() == 1)
+ 			LOG("probe: OSKext::start not routed, sleep/umd/xhci/kext hooks not installed");
+ 		else if (!patcher.routeMultiple(KernelPatcher::KernelID, &req, 1))
+ 			LOG("failed to route OSKext::start (err %d)", patcher.getError());
+diff --git a/src/RembrandtGfx/mmio.cpp b/src/RembrandtGfx/mmio.cpp
+index 5d0ea6e..f218eb1 100644
+--- a/src/RembrandtGfx/mmio.cpp
++++ b/src/RembrandtGfx/mmio.cpp
+@@ -35,7 +35,7 @@ static bool mapMmio() {
+ 			auto mem = svc->getDeviceMemoryWithIndex(i);
+ 			if (!mem || mem->getLength() != RegApertureSize)
+ 				continue;
+-			gMmioMap = mem->map(rmbProbe() ? kIOMapInhibitCache | kIOMapReadOnly : kIOMapInhibitCache);
++			gMmioMap = mem->map(rmbStage() == 1 ? kIOMapInhibitCache | kIOMapReadOnly : kIOMapInhibitCache);
+ 			if (gMmioMap) {
+ 				gMmio = reinterpret_cast<volatile uint32_t *>(gMmioMap->getVirtualAddress());
+ 				LOG("mapped register aperture (device memory %u)", i);
+@@ -54,9 +54,21 @@ uint32_t mmioRead(uint32_t reg) {
+ 	return mapMmio() && reg < RegApertureSize / 4 ? gMmio[reg] : 0xFFFFFFFF;
+ }
+ 
++// Stage 2: the three writes of one GetSmuVersion (0x02, "Get PMFW version") query on the PMFW
++// mailbox, MP1 C2PMSG_90 / 82 / 66 = response cleared, argument 0, message. Linux sends the same
++// query at init (smu_v13_0_check_fw_version, pm/swsmu/smu13/smu_v13_0.c:254-263). Nothing else.
++static bool stage2MayWrite(uint32_t reg, uint32_t value) {
++	constexpr uint32_t Msg = 0x16000 + 0x282, Arg = 0x16000 + 0x292, Resp = 0x16000 + 0x29a;
++	return rmbStage() == 2 && ((reg == Resp && !value) || (reg == Arg && !value) || (reg == Msg && value == 0x02));
++}
++
+ void mmioWrite(uint32_t reg, uint32_t value) {
+-	if (rmbProbe())
+-		return;  // probe mode: no register write, whoever asks
++	if (rmbProbe() && !stage2MayWrite(reg, value)) {  // stages 1 and 2: no register write, whoever asks
++		static uint32_t dropped;
++		if (dropped++ < 40)
++			LOG("mmio: stage %u dropped write %x = %x (#%u)", rmbStage(), reg, value, dropped);
++		return;
++	}
+ 	if (mapMmio() && reg < RegApertureSize / 4)
+ 		gMmio[reg] = value;
+ }
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 86293c2..98a1ff0 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -15,10 +15,17 @@ extern "C" int printf(const char *fmt, ...) __printflike(1, 2);
+ // -rmbverbose: bulk bring-up tracing (DAL log, DAL write log, DMUB ring dumps, register
+ // snapshots). Off by default: ~1 MB of synchronous serial printf slows the whole boot.
+ bool rmbVerbose();
+-// -rmbprobe (610M port, ON by default; -rmbnoprobe = off; -rmbprobe wins if both are given): bring-up
+-// mode. No kernel or kext code patched, no write to PCI config space or to the USB4 router, and the
+-// only GPU registers written are MM_INDEX and MM_INDEX_HI (saved and restored) by ipdisc.cpp, which
+-// logs the PCI identity and the IP discovery table ("probe:" lines). -rmbprobero: not even those two.
++// 610M port: staged bring-up. rmbStage() is
++//   1  default (also rmbstage=1 or any unknown value): no kernel or kext code patched, no write to PCI
++//      config space or to the USB4 router; the only GPU registers written are MM_INDEX and MM_INDEX_HI
++//      (saved and restored) by ipdisc.cpp, which logs the PCI identity and the IP discovery table
++//      ("probe:" lines). -rmbprobero: not even those two.
++//   2  rmbstage=2: stage 1 plus the PCI identity hooks, the HWLibs identity / software-init hooks and
++//      a headless, write-blocking set of framebuffer hooks. ttl_hw_init and psp_hw_init fail before
++//      Apple's code runs; mmioWrite passes only the three mailbox writes of one GetSmuVersion query.
++//   0  full driver as upstream: only with -rmbnoprobe (and without -rmbprobe, which wins).
++// rmbProbe() = stage 1 or 2.
++uint32_t rmbStage();
+ bool rmbProbe();
+ class IOService;
+ void ipDiscProbe(IOService *svc);
+@@ -101,6 +108,8 @@ uint32_t phyPeek();
+ // AppleGraphicsDeviceControl load address (its __TEXT), for AGDC statics.
+ void displaySetAgdcBase(mach_vm_address_t base);
+ void displayRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
++// Stage 2 variant: register hooks only, writes dropped; false if any of them could not be installed.
++bool displayRouteStage2(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+ // AppleBacklight (AppleIntelPanelA under PNLF): panel table so it publishes "brightness".
+ void displayRouteBacklight(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+ bool mmioAvailable();
+diff --git a/src/RembrandtGfx/smu.cpp b/src/RembrandtGfx/smu.cpp
+index 3341742..4f11d73 100644
+--- a/src/RembrandtGfx/smu.cpp
++++ b/src/RembrandtGfx/smu.cpp
+@@ -34,6 +34,10 @@ bool waitResp(uint32_t &resp, int ms = 1000) {
+ // Returns the PMFW response (1 = OK); the result argument is read back into arg.
+ uint32_t sendMsg(uint32_t msg, uint32_t &arg, int ms = 1000) {
+ 	uint32_t resp;
++	if (rmbStage() == 2 && msg != PPSMC_MSG_GetSmuVersion) {  // stage 2 sends nothing that changes state
++		LOG("smu: stage 2, msg %#x not sent", msg);
++		return 0;
++	}
+ 	if (!waitResp(resp)) {
+ 		LOG("smu: mailbox busy before msg %#x", msg);
+ 		return 0;
+@@ -83,6 +87,10 @@ uint64_t smuSwInit(uint64_t in, uint64_t out, uint64_t, uint64_t, uint64_t, uint
+ 	uint32_t arg = 0;
+ 	auto resp = sendMsg(PPSMC_MSG_GetSmuVersion, arg);
+ 	LOG("smu_sw_init: PMFW version %u.%u.%u (resp %u)", (arg >> 16) & 0xFF, (arg >> 8) & 0xFF, arg & 0xFF, resp);
++	if (rmbStage() == 2) {  // no engine halt, no MODE2 reset: nothing that changes state is sent
++		LOG("smu_sw_init: stage 2, only GetSmuVersion was sent");
++		return 0;
++	}
+ 
+ 	// The APU keeps GC/SDMA/CP state across VM runs (and from the host driver): active HQDs, a wedged
+ 	// KIQ, latched errors. Reset the GFX engines the way Linux does on Rembrandt (yellow_carp_mode2_reset)
+@@ -107,6 +115,10 @@ uint64_t smuSwInit(uint64_t in, uint64_t out, uint64_t, uint64_t, uint64_t, uint
+ uint64_t smuHwInit(uint64_t handle, uint64_t in, uint64_t out, uint64_t, uint64_t, uint64_t) {
+ 	if (!handle || !in || !out)
+ 		return 1;
++	if (rmbStage() == 2) {
++		LOG("stage 2: smu_hw_init BLOCKED, returning 1, nothing sent");
++		return 1;
++	}
+ 	// Keep GFX powered while the PSP/RLC/GC bring-up below us pokes its registers.
+ 	uint32_t arg = 0;
+ 	LOG("smu_hw_init: DisallowGfxOff resp %u", sendMsg(PPSMC_MSG_DisallowGfxOff, arg));
+diff --git a/src/RembrandtGfx/tests/pci-identity.cpp b/src/RembrandtGfx/tests/pci-identity.cpp
+index b6cf662..db7d0db 100644
+--- a/src/RembrandtGfx/tests/pci-identity.cpp
++++ b/src/RembrandtGfx/tests/pci-identity.cpp
+@@ -68,5 +68,25 @@ int main() {
+ 		expect("other revision PCI16", wrapPciRead16(&other, 8), revision);
+ 		expect("other revision PCI32", wrapPciRead32(&other, 8), 0x03000000 | revision);
+ 	}
++	// The 610M as measured: 1002:1506 revision C1. The ID is mapped, the revision is kept...
++	auto mendocino = config(0x1002, 0x1506, 0x030000c1);
++	expect("610M PCI16 device ID", wrapPciRead16(&mendocino, 2), 0x73ff);
++	expect("610M PCI32 vendor/device", wrapPciRead32(&mendocino, 0), 0x73ff1002);
++	expect("610M PCI8 revision kept", wrapPciRead8(&mendocino, 8), 0xc1);
++	expect("610M PCI16 revision kept", wrapPciRead16(&mendocino, 8), 0xc1);
++	expect("610M PCI32 revision/class kept", wrapPciRead32(&mendocino, 8), 0x030000c1);
++	// ...unless -rmbrevc7 asks for C1 -> C7 (S02 fallback), and then only for 1002:1506.
++	gRevC1ToC7 = true;
++	expect("610M -rmbrevc7 PCI8 revision", wrapPciRead8(&mendocino, 8), 0xc7);
++	expect("610M -rmbrevc7 PCI16 revision", wrapPciRead16(&mendocino, 8), 0xc7);
++	expect("610M -rmbrevc7 PCI32 revision/class", wrapPciRead32(&mendocino, 8), 0x030000c7);
++	expect("610M -rmbrevc7 raw revision remains original", read8(&mendocino, 8), 0xc1);
++	for (auto other : {config(0x1002, 0x1681, 0x030000c1), config(0x10de, 0x1506, 0x030000c1), config(0x1002, 0x73ff, 0x030000c1)}) {
++		expect("-rmbrevc7 other device PCI8", wrapPciRead8(&other, 8), 0xc1);
++		expect("-rmbrevc7 other device PCI16", wrapPciRead16(&other, 8), 0xc1);
++		expect("-rmbrevc7 other device PCI32", wrapPciRead32(&other, 8), 0x030000c1);
++	}
++	expect("-rmbrevc7 keeps 02 -> c7", wrapPciRead8(&gpu, 8), 0xc7);
++	gRevC1ToC7 = false;
+ 	std::printf("PASS: %u PCI identity checks using the source hooks\n", checks);
+ }
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,73 @@
+From fb0981aa10969c56da99d5f7c1fe2ce8311a0039 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Fri, 20 Nov 2026 19:18:25 +0000
+Subject: [PATCH 04/48] =?UTF-8?q?fix:=20sonda=20pede=20a=20lista=20de=20me?=
+ =?UTF-8?q?m=C3=B3ria=20da=20placa=20quando=20nenhum=20driver=20a=20montou?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No segundo boot do M1 na 82X5 a sonda parou em 'BAR 5 has no device memory'.
+A lista só é montada quando um driver vai casar com o dispositivo, e nenhum
+driver da Apple casa com a 1002:1506 no estágio 1. A sonda agora chama
+getResources() e, se ainda faltar, usa o endereço da BAR 5 direto.
+---
+ src/RembrandtGfx/ipdisc.cpp | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/src/RembrandtGfx/ipdisc.cpp b/src/RembrandtGfx/ipdisc.cpp
+index 36edaf1..eec3d7a 100644
+--- a/src/RembrandtGfx/ipdisc.cpp
++++ b/src/RembrandtGfx/ipdisc.cpp
+@@ -200,7 +200,7 @@ uint32_t dataU32(IORegistryEntry *e, const char *key) {
+ }
+ 
+ // One register (dword index) through a read-only one-page mapping of the register BAR.
+-bool regRead(IODeviceMemory *mem, uint32_t reg, uint32_t &value) {
++bool regRead(IOMemoryDescriptor *mem, uint32_t reg, uint32_t &value) {
+ 	uint64_t off = static_cast<uint64_t>(reg) * 4, page = off & ~0xFFFULL;
+ 	if (page + 0x1000 > mem->getLength())
+ 		return false;
+@@ -214,7 +214,7 @@ bool regRead(IODeviceMemory *mem, uint32_t reg, uint32_t &value) {
+ 
+ // The table by MM_INDEX. Page 0 of the register BAR is the only mapping in this file that is not
+ // read-only; it exists for the duration of mmCopy and nothing else uses it for writing.
+-bool mmRead(IODeviceMemory *mem, uint64_t pos) {
++bool mmRead(IOMemoryDescriptor *mem, uint64_t pos) {
+ 	if (mem->getLength() < 0x1000)
+ 		return false;
+ 	auto map = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 0x1000);
+@@ -271,7 +271,15 @@ void probe(IOService *svc, bool retry) {
+ 	for (uint32_t i = 0; i < 6; i++)
+ 		bar[i] = pci->configRead32(sp, static_cast<UInt8>(kIOPCIConfigBaseAddress0 + i * 4));
+ 	LOG("probe: BAR0-5 %08x %08x %08x %08x %08x %08x", bar[0], bar[1], bar[2], bar[3], bar[4], bar[5]);
+-	IODeviceMemory *regs = nullptr;
++	IOMemoryDescriptor *regs = nullptr;
++	// 82X5, M1 boot 2 (2026-11-20): no "device memory" line at all. IOPCIFamily builds the list in
++	// IOPCIDevice::getResources(), which IOKit calls when a driver is about to probe the nub, and no
++	// Apple driver matches 1002:1506 at stage 1. Ask for it here; the call returns at once when the
++	// list already exists.
++	if (!svc->getDeviceMemoryCount()) {
++		IOReturn r = svc->getResources();
++		LOG("probe: no device memory yet, getResources = %x, %u entries now", r, svc->getDeviceMemoryCount());
++	}
+ 	for (uint32_t i = 0; i < svc->getDeviceMemoryCount() && i < 8; i++) {
+ 		auto m = svc->getDeviceMemoryWithIndex(i);
+ 		if (!m)
+@@ -299,6 +307,13 @@ void probe(IOService *svc, bool retry) {
+ 			svc->release();
+ 		return;
+ 	}
++	// Last resort: the BAR value itself. 64 KiB covers every register this file reads (highest:
++	// GCMC_VM_FB_OFFSET at byte a51c); the real BAR is larger. Kept for the lifetime of the kext.
++	if (!regs && bar[5] && !(bar[5] & 7)) {
++		regs = IOMemoryDescriptor::withPhysicalAddress(bar[5] & ~0xFULL, 0x10000, kIODirectionInOut);
++		LOG("probe: BAR 5 not in the device memory list, using phys %llx length 10000 directly%s",
++		    static_cast<uint64_t>(bar[5] & ~0xFULL), regs ? "" : ": FAILED");
++	}
+ 	uint32_t memSize = 0, fbOff = 0;
+ 	if (!regs || !regRead(regs, RegMemSize, memSize) || !regRead(regs, RegFbOffset, fbOff)) {
+ 		LOG("probe: FAIL register BAR 5 (%08x) %s", bar[5], regs ? "too small or not mappable" : "has no device memory");
+-- 
+2.39.5 (Apple Git-154)
+

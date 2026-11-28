@@ -1,0 +1,139 @@
+From c5b1d9a68c57364b6574722dc34a05d39e2a1111 Mon Sep 17 00:00:00 2001
+From: Roger Luft <rluft@pop.local>
+Date: Tue, 24 Nov 2026 09:21:21 -0800
+Subject: [PATCH 13/48] feat: DisallowGfxOff antes do psp_hw_init e
+ garante/instrumenta AUTOLOAD_RLC
+
+---
+ src/RembrandtGfx/firmware.cpp | 57 +++++++++++++++++++++++++++++++++--
+ src/RembrandtGfx/smu.cpp      | 15 +++++++--
+ 2 files changed, 67 insertions(+), 5 deletions(-)
+
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index 91867ee..3d5567b 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -116,9 +116,40 @@ IOReturn powerHandler(void *, void *, UInt32 type, IOService *, void *arg, vm_si
+ 		LOG("shutdown: RembrandtGfx shutdown steps done");
+ 	return kIOReturnSuccess;
+ }
++bool skipFwType(uint32_t type);
++
+ uint64_t wrapPspTmrInit(uint64_t psp, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	auto p = reinterpret_cast<uint8_t *>(psp);
+-	LOG("fw: TOC %#x bytes -> %#x", *reinterpret_cast<uint32_t *>(p + 0x3580), FW_SIZE(toc));
++	uint32_t fwCount = *reinterpret_cast<uint32_t *>(p + 0x34a0);
++	uint32_t autoIdx = *reinterpret_cast<uint32_t *>(p + 0x3590);
++	LOG("fw: TOC %#x bytes -> %#x; fwCount %u autoIdx %#x; RLC_CNTL %x RLC_STAT %x BOOTLOAD %x GRBM %x",
++	    *reinterpret_cast<uint32_t *>(p + 0x3580), FW_SIZE(toc), fwCount, autoIdx,
++	    mmioRead(0xA000 + 0x4c00), mmioRead(0xA000 + 0x4c04), mmioRead(0xA000 + 0x4e8d), mmioRead(0x1260 + 0x0da4));
++	// _psp_np_fw_load sends GFX_CMD_ID_AUTOLOAD_RLC (0x21) only when i == psp+0x3590 AND the entry
++	// was not skipped by wrapCapCheck. If autoIdx is unset (0xffffffff) or points to a skipped type,
++	// point it at the last non-skipped firmware entry so AUTOLOAD_RLC is guaranteed to run.
++	if (fwCount > 0 && fwCount <= 45) {
++		bool needFix = autoIdx >= fwCount;
++		if (!needFix) {
++			uint32_t t = *reinterpret_cast<uint32_t *>(p + 0x2c0c + autoIdx * 0x28);
++			needFix = skipFwType(t);
++		}
++		if (needFix) {
++			uint32_t last = 0xFFFFFFFFu;
++			for (uint32_t i = fwCount; i-- > 0;) {
++				uint32_t t = *reinterpret_cast<uint32_t *>(p + 0x2c0c + i * 0x28);
++				if (!skipFwType(t)) {
++					last = i;
++					break;
++				}
++			}
++			if (last != 0xFFFFFFFFu) {
++				*reinterpret_cast<uint32_t *>(p + 0x3590) = last;
++				LOG("fw: fixed autoIdx %#x -> %u (type %u)", autoIdx, last,
++				    *reinterpret_cast<uint32_t *>(p + 0x2c0c + last * 0x28));
++			}
++		}
++	}
+ 	*reinterpret_cast<const uint8_t **>(p + 0x3588) = fw_apu_toc;
+ 	*reinterpret_cast<uint32_t *>(p + 0x3580) = FW_SIZE(toc);
+ 	auto r = reinterpret_cast<Fn6>(orgPspTmrInit)(psp, b, c, d, e, f);
+@@ -197,6 +228,25 @@ uint64_t wrapCapCheck(uint64_t psp, uint64_t type, uint64_t c, uint64_t d, uint6
+ 	return r;
+ }
+ 
++mach_vm_address_t orgPspCmdKmSubmit;
++uint64_t wrapPspCmdKmSubmit(uint64_t psp, uint64_t inBuf, uint64_t outResp, uint64_t d, uint64_t e, uint64_t f) {
++	uint32_t cmd = inBuf ? *reinterpret_cast<const uint32_t *>(inBuf) : 0;
++	uint32_t fwType = (inBuf && cmd == 6) ? *reinterpret_cast<const uint32_t *>(inBuf + 0x10) : 0;
++	auto r = reinterpret_cast<Fn6>(orgPspCmdKmSubmit)(psp, inBuf, outResp, d, e, f);
++	if (rmbStage() == 3 || rmbVerbose() || (r & 0xFFFFFFFF)) {
++		if (cmd == 0xd) {
++			LOG("psp-km: AUTOLOAD_RLC (0xd) ret=%llx; RLC_CNTL=%x RLC_STAT=%x BOOTLOAD=%x CP_STAT=%x GRBM=%x",
++			    r & 0xFFFFFFFF, mmioRead(0xA000 + 0x4c00), mmioRead(0xA000 + 0x4c04), mmioRead(0xA000 + 0x4e8d),
++			    mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4));
++		} else if (cmd == 6) {
++			LOG("psp-km: LOAD_IP_FW type=%u ret=%llx", fwType, r & 0xFFFFFFFF);
++		} else {
++			LOG("psp-km: cmd=%#x ret=%llx", cmd, r & 0xFFFFFFFF);
++		}
++	}
++	return r;
++}
++
+ // DMCUB: dmcub_set_fw_entry_info sends DCN 3.1.x to dmcub_dcn31_get_fw_constrant, which only
+ // records the version; HWLibs has no DCN 3.1 image, so the DMUB firmware is never handed to the
+ // PSP and DAL's DMUB never comes up. Queue Rembrandt's signed image the way the DCN 3.0.2 path
+@@ -247,6 +297,7 @@ void firmwareRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t addre
+ 	KernelPatcher::RouteRequest reqs[] {
+ 		{"_psp_tmr_init", wrapPspTmrInit, orgPspTmrInit},
+ 		{"_psp_np_fw_load_capability_check", wrapCapCheck, orgCapCheck},
++		{"_psp_cmd_km_submit", wrapPspCmdKmSubmit, orgPspCmdKmSubmit},
+ 		{"_dmcub_dcn31_get_fw_constrant", wrapDcn31FwConstraint, orgDcn31FwConstraint},
+ 		{"_psp_power_down_event", wrapPspPowerDown, orgPspPowerDown},
+ 	};
+@@ -262,9 +313,9 @@ void firmwareRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t addre
+ 		if (!gPspTeardown[i])
+ 			LOG("fw: %s not found", pspTeardown[i]);
+ 	}
+-	// Stage 3 takes the first two only: no DMUB image is queued (headless) and Apple's
++	// Stage 3 takes the first three only: no DMUB image is queued (headless) and Apple's
+ 	// psp_power_down_event stays as it is (no sleep support at this stage).
+-	size_t nreqs = rmbStage() == 3 ? 2 : arrsize(reqs);
++	size_t nreqs = rmbStage() == 3 ? 3 : arrsize(reqs);
+ 	gFwHooksOk = patcher.routeMultiple(index, reqs, nreqs, address, size);
+ 	if (!gFwHooksOk)
+ 		LOG("fw: failed to route PSP firmware hooks (err %d)", patcher.getError());
+diff --git a/src/RembrandtGfx/smu.cpp b/src/RembrandtGfx/smu.cpp
+index c641677..ad9f050 100644
+--- a/src/RembrandtGfx/smu.cpp
++++ b/src/RembrandtGfx/smu.cpp
+@@ -196,7 +196,17 @@ bool smuPmfwOk() { return gPmfwResp == 1 && gPmfwVersion && gPmfwVersion != 0xFF
+ // upstream's own bare-metal configuration boots with -rmbnomode2.
+ void smuStage3BeforeHwInit() {
+ 	constexpr uint32_t GrbmStatus = 0x1260 + 0x0da4, MecIp = 0x1260 + 0x0f48;
+-	LOG("stage 3: before hw init: GRBM_STATUS %x MEC1 IP %x", mmioRead(GrbmStatus), mmioRead(MecIp));
++	constexpr uint32_t RlcCntl = 0xA000 + 0x4c00, RlcStat = 0xA000 + 0x4c04, RlcBoot = 0xA000 + 0x4e8d;
++	LOG("stage 3: before hw init: GRBM_STATUS %x MEC1 IP %x RLC_CNTL %x RLC_STAT %x BOOTLOAD %x",
++	    mmioRead(GrbmStatus), mmioRead(MecIp), mmioRead(RlcCntl), mmioRead(RlcStat), mmioRead(RlcBoot));
++	// Disallow GFXOFF before haltGfxEngines / gvm_hw_init / psp_hw_init (AUTOLOAD_RLC), because
++	// smu_hw_init runs *after* psp_hw_init in TlsHwInit and GC/RLC writes/autoload fail while GFX is off.
++	if (!checkKernelArgument("-rmbnogfxoffpre")) {
++		uint32_t arg = 0;
++		auto resp = sendMsg(PPSMC_MSG_DisallowGfxOff, arg);
++		LOG("stage 3: pre-hw DisallowGfxOff resp %u; GRBM_STATUS %x RLC_CNTL %x RLC_STAT %x BOOTLOAD %x",
++		    resp, mmioRead(GrbmStatus), mmioRead(RlcCntl), mmioRead(RlcStat), mmioRead(RlcBoot));
++	}
+ 	if (!checkKernelArgument("-rmbnohalt"))
+ 		haltGfxEngines("before hw init");
+ 	if (!checkKernelArgument("-rmbmode2")) {
+@@ -206,7 +216,8 @@ void smuStage3BeforeHwInit() {
+ 	uint32_t arg = 2;  // SMU_RESET_MODE_2
+ 	auto resp = sendMsg(PPSMC_MSG_GfxDeviceDriverReset, arg, 5000);
+ 	IOSleep(100);
+-	LOG("stage 3: MODE2 reset resp %u; GRBM_STATUS %x MEC1 IP %x", resp, mmioRead(GrbmStatus), mmioRead(MecIp));
++	LOG("stage 3: MODE2 reset resp %u; GRBM_STATUS %x MEC1 IP %x RLC_CNTL %x RLC_STAT %x BOOTLOAD %x",
++	    resp, mmioRead(GrbmStatus), mmioRead(MecIp), mmioRead(RlcCntl), mmioRead(RlcStat), mmioRead(RlcBoot));
+ }
+ 
+ void smuRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+-- 
+2.39.5 (Apple Git-154)
+

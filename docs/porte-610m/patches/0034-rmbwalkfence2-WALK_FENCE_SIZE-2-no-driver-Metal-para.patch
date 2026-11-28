@@ -1,0 +1,111 @@
+From cf82121b3660912c53ff60acd46a4eb39e025dc9 Mon Sep 17 00:00:00 2001
+From: Roger Luft <rluft@pop.local>
+Date: Thu, 26 Nov 2026 01:58:11 -0300
+Subject: [PATCH 34/48] -rmbwalkfence2: WALK_FENCE_SIZE 2 no driver Metal para
+ 2 pipes (0030)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ src/RembrandtGfx/umdpatch.cpp   | 49 +++++++++++++++++++++++++++++++--
+ 2 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index d2b12fa..e5fb61f 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0029, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0030, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/umdpatch.cpp b/src/RembrandtGfx/umdpatch.cpp
+index aa83039..7ed9245 100644
+--- a/src/RembrandtGfx/umdpatch.cpp
++++ b/src/RembrandtGfx/umdpatch.cpp
+@@ -21,6 +21,24 @@ const uint8_t xorPat[] {0x48, 0x63, 0x04, 0x87, 0x48, 0x01, 0xf8, 0x8b, 0x76, 0x
+ const uint8_t xorRep[] {0x31, 0xc0, 0x0f, 0x1f, 0x40, 0x00, 0x66, 0x90};
+ constexpr size_t xorRepOff = 13;
+ 
++// Patch 0030 (-rmbwalkfence2): PA_SC_MODE_CNTL_1.WALK_FENCE_SIZE (bits 6:4) is a constant 3 in the UMD,
++// right for 4 tile pipes (Navi 23, 680M); Mesa uses 2 when num_tile_pipes == 2 (si_state.c:3309), and the
++// 610M has 2 pipes (GB_ADDR_CONFIG 0x41). Both sites are unique in AMDRadeonX6000MTLDriver (15.8.1):
++//   amdMtl_GFX10_InitRenderPipelineHwCtxRegs: movq $0x60201b8,0x48(%rbx)  -> 0x60201a8
++//   Gfx10BltDrawRegs::InitContextRegs:        orl  $0x60201b0,%ecx        -> 0x60201a0
++struct WfPat {
++	uint8_t pat[8];
++	size_t len, off;
++	uint8_t from, to;
++	const char *name;
++};
++const WfPat wfPats[] {
++	{{0x48, 0xc7, 0x43, 0x48, 0xb8, 0x01, 0x02, 0x06}, 8, 4, 0xb8, 0xa8, "render pipeline"},
++	{{0x81, 0xc9, 0xb0, 0x01, 0x02, 0x06}, 6, 2, 0xb0, 0xa0, "blt draw"},
++};
++bool gDoXor, gDoWf;
++uint32_t gWfPatched;
++
+ mach_vm_address_t orgCsValidateRange;
+ mach_vm_address_t orgCsValidatePage;
+ uint32_t gXorPatched;
+@@ -37,9 +55,31 @@ void writeRep(uint8_t *at, const char *how, size_t off) {
+ 		    (unsigned long)off, gXorPatched);
+ }
+ 
++void patchWalkFence(uint8_t *p, size_t size) {
++	for (auto &w : wfPats) {
++		if (size < w.len)
++			continue;
++		for (size_t o = 0, end = size - w.len; o <= end; o++) {
++			if (p[o] != w.pat[0] || memcmp(p + o, w.pat, w.len))
++				continue;
++			if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
++				LOG("umd: no write access for walk fence patch");
++				return;
++			}
++			p[o + w.off] = w.to;
++			MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
++			if (++gWfPatched <= 8)
++				LOG("umd: PA_SC_MODE_CNTL_1 WALK_FENCE_SIZE 3 -> 2 (%s, page off 0x%lx, #%u)", w.name,
++				    (unsigned long)o, gWfPatched);
++		}
++	}
++}
++
+ void patchPage(const void *data, size_t size) {
+ 	auto p = static_cast<uint8_t *>(const_cast<void *>(data));
+-	if (!p || size < sizeof(xorPat))
++	if (p && gDoWf)
++		patchWalkFence(p, size);
++	if (!gDoXor || !p || size < sizeof(xorPat))
+ 		return;
+ 	// 15.0 UMD: the pattern sits at page offset 0xbfc, i.e. it straddles a 4K page boundary and each
+ 	// page is validated alone → match the pattern's tail at the start of the range (k cut bytes, the
+@@ -77,7 +117,9 @@ void wrapCsValidatePage(void *vp, memory_object_t pager, memory_object_offset_t
+ }  // namespace
+ 
+ void umdRoute(KernelPatcher &patcher) {
+-	if (rmbProbe() || checkKernelArgument("-rmbnoxor0"))
++	gDoXor = !rmbProbe() && !checkKernelArgument("-rmbnoxor0");
++	gDoWf = checkKernelArgument("-rmbwalkfence2");  // patch 0030, also in probe stages
++	if (!gDoXor && !gDoWf)
+ 		return;
+ 	KernelPatcher::RouteRequest req[] {
+ 		{"_cs_validate_page", wrapCsValidatePage, orgCsValidatePage},
+@@ -86,6 +128,7 @@ void umdRoute(KernelPatcher &patcher) {
+ 	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, req, arrsize(req)))
+ 		LOG("umd: failed to route cs_validate_page/range (err %d)", patcher.getError());
+ 	else
+-		LOG("umd: pipeBankXor 0 page patch installed (cs_validate_page + range)");
++		LOG("umd: page patch installed (cs_validate_page + range): pipeBankXor 0 %s, walk fence 2 %s",
++		    gDoXor ? "on" : "off", gDoWf ? "on" : "off");
+ 	patcher.clearError();
+ }
+-- 
+2.39.5 (Apple Git-154)
+

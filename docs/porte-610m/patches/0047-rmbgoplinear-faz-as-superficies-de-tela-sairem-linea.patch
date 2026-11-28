@@ -1,0 +1,79 @@
+From 700fb52654f99dfc0ded1047fb7e5c97c7aa24e1 Mon Sep 17 00:00:00 2001
+From: fzmac <fzmac@localhost>
+Date: Thu, 26 Nov 2026 23:11:48 -0300
+Subject: [PATCH 47/48] -rmbgoplinear faz as superficies de tela sairem
+ lineares (getPreferredSwizzleMode2), para o HUBP0 ler com a configuracao do
+ GOP (0041)
+
+Co-authored-by: opus-fable
+---
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ src/RembrandtGfx/probe.cpp      | 32 ++++++++++++++++++++++++++++++++
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 137bdda..6210590 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1317,7 +1317,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0040, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0041, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/probe.cpp b/src/RembrandtGfx/probe.cpp
+index 4939f73..0a8af90 100644
+--- a/src/RembrandtGfx/probe.cpp
++++ b/src/RembrandtGfx/probe.cpp
+@@ -1112,6 +1112,32 @@ uint64_t wrapAccelSubmitScan(uint64_t self, uint64_t desc) {
+ 	return reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(orgAccelSubmitCommands)(self, desc);
+ }
+ 
++// Patch 0041 (-rmbgoplinear): the panel showed the compositor surface with the right horizontal
++// positions but repeated lines and a flat colour below: HUBP0 keeps the GOP's linear request/swath/DET
++// setup, while WindowServer's display surfaces come as 64KB_R_X (sw 27, 0040). Apple's DAL would
++// recompute that setup for a tiled surface; our flip path does not. AMDHWAlignManager2::
++// getPreferredSwizzleMode2 (be9957e) picks the swizzle for surfaces the kernel lays out; the input's
++// flags (+0x4, ADDR2_SURFACE_FLAGS) bit 5 is "display", which Apple itself reads at +0x72. Return
++// ADDR_SW_LINEAR (0) only for display surfaces, everything else untouched. Linear pitch for 1366 px
++// 32 bpp aligned to 256 B is 1408 px, the same pitch HUBP0 already has. The flip then carries sw 0 and
++// flipTiling() programs TILING_CONFIG SW_MODE 0 back (0040).
++mach_vm_address_t orgPrefSwizzle;
++volatile uint32_t gPrefSwzCalls, gPrefSwzForced;
++uint64_t wrapPrefSwizzle(uint64_t self, uint64_t in) {
++	auto r = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(orgPrefSwizzle)(self, in);
++	uint32_t c = OSIncrementAtomic(&gPrefSwzCalls) + 1;
++	uint32_t flags = in ? *reinterpret_cast<const volatile uint32_t *>(in + 4) : 0;
++	bool display = (flags & 0x20) != 0;
++	if (c <= 30 || (display && gPrefSwzForced < 30))
++		LOG("goplinear: getPreferredSwizzleMode2 #%u flags %x %s -> %u%s", c, flags, display ? "display" : "", static_cast<uint32_t>(r),
++		    display && static_cast<uint32_t>(r) ? " forced to 0 (linear)" : "");
++	if (display && static_cast<uint32_t>(r)) {
++		OSIncrementAtomic(&gPrefSwzForced);
++		return 0;
++	}
++	return r;
++}
++
+ // Patch 0028b (-rmbgopfb only), measurement. AMDHWDisplay::getDisplayInfo(idx, b, b, fb, info) fills
+ // the _FRAMEBUFFER_INFO that set_display_mode_and_vram reserves from: +0 VRAM offset ("ATY,fb_offset"),
+ // +8 computed size, +0xc "ATY,fb_size". displayModeDidChange returning false makes IOAcceleratorFamily2
+@@ -1213,6 +1239,12 @@ void probeRouteAccel(KernelPatcher &patcher, size_t index, mach_vm_address_t add
+ 		};
+ 		route(patcher, index, address, size, gr, arrsize(gr));
+ 	}
++	if (checkKernelArgument("-rmbgoplinear")) {  // patch 0041
++		KernelPatcher::RouteRequest lr {"__ZN33AMDRadeonX6000_AMDHWAlignManager224getPreferredSwizzleMode2EP33_ADDR2_COMPUTE_SURFACE_INFO_INPUT",
++			wrapPrefSwizzle, orgPrefSwizzle};
++		route(patcher, index, address, size, &lr, 1);
++		LOG("goplinear: display surfaces laid out linear (getPreferredSwizzleMode2 routed: %s)", orgPrefSwizzle ? "yes" : "NO");
++	}
+ 	if (checkKernelArgument("-rmbnosubmit")) {
+ 		KernelPatcher::RouteRequest req {"__ZN30AMDRadeonX6000_AMDAccelChannel14submitCommandsEP24IOAccelCommandDescriptor",
+ 			wrapAccelSubmitCommands, orgAccelSubmitCommands};
+-- 
+2.39.5 (Apple Git-154)
+

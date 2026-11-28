@@ -1,0 +1,50 @@
+From f48107d944f8715af04396900c53f21028c8f278 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 21:50:52 -0300
+Subject: [PATCH 43/48] -rmbgopflip aceita so endereco MC dentro do FB (scanout
+ fisico, Radeonized #8); tira o ramo base+deslocamento (0038b)
+
+Co-authored-by: opus-fable
+---
+ src/RembrandtGfx/display.cpp    | 4 +---
+ src/RembrandtGfx/kern_start.cpp | 2 +-
+ 2 files changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index b9e5e05..d0bcd85 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3443,7 +3443,7 @@ volatile SInt32 gTxnSeen;
+ volatile uint32_t gTicks;
+ // Patch 0038 (-rmbgopflip): each accepted 'amtr' flip repoints HUBP0 at the surface the accelerator
+ // rendered. The address is the u64 at flip+0x8 (writeFlipParameters bec0c50 copies 0x68 bytes to
+-// flip+8); accepted as an MC address inside the frame buffer, or as an offset from its base, and
++// flip+8); accepted only as an MC address inside the frame buffer (scanout is physical, Radeonized #8), and
+ // only 256-byte aligned. HIGH then LOW, as Linux (dcn20_hubp.c: "program high first and then the
+ // low addr, order matters!"). Counted here, logged by the tick thread.
+ bool gFlipOn;
+@@ -3779,8 +3779,6 @@ IOReturn setAttribute(void *fb, IOSelect sel, uintptr_t value) {
+ 			uint64_t need = static_cast<uint64_t>(gMode.rowBytes) * gMode.h, base = gMode.fbBaseMc, mc = 0;
+ 			if (a >= base && a + need <= base + Vram)
+ 				mc = a;
+-			else if (a + need <= Vram)
+-				mc = base + a;
+ 			gFlipLast = a;
+ 			if (mc && !(mc & 0xff)) {
+ 				mmioWrite(0x3acb, static_cast<uint32_t>(mc >> 32) & 0xffff);
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index e051f54..57fc120 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1317,7 +1317,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0038, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0038b, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,207 @@
+From 7edc3c0ffdf1d70e9a952aee553317bda23bfe81 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 00:10:34 -0300
+Subject: [PATCH 29/48] fix: -rmbgopfb publica ATY,fb_offset/fb_size e responde
+ 'fbrs' (0028b)
+
+Os dois boots do 0028 (25/11 22:42 e 22:44) deram panico em
+IOAccelDisplayMachine::display_mode_did_change ("driver returns false").
+Lido nos binarios do 15.8.1: reserveNDRVSpace reserva [base da VRAM, +S)
+para o console do firmware (S = 'fbrs') e um bloco de 0xa000000 logo depois;
+set_display_mode_and_vram libera esse bloco e reserva a tela em
+base + "ATY,fb_offset", tamanho max(calculado, "ATY,fb_size"). Quem publica
+essas propriedades e o setDisplayMode da Apple, que o 0028 substituiu: o
+deslocamento ficava 0, em cima da reserva do console, e a reserva falhava.
+
+Agora, so com -rmbgopfb: 'fbrs' = 16 MB (constante, perguntado antes da
+amostragem do modo); fb0 ganha ATY,fb_offset = 16 MB (8 bytes),
+ATY,fb_size = rowBytes x altura (8 bytes) e ATY,fb_linebytes (4 bytes),
+publicados no primeiro enableController do fb0. Nenhum registrador escrito;
+o HUBP0 segue no console em VRAM+0.
+
+Medicao: getDisplayInfo registra o _FRAMEBUFFER_INFO; se
+displayModeDidChange devolver falso, espera 3 s antes de repassar (o panico
+acontece igual; so da tempo de o log chegar ao disco).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/display.cpp    | 53 +++++++++++++++++++++++++++++++--
+ src/RembrandtGfx/kern_start.cpp |  4 +--
+ src/RembrandtGfx/probe.cpp      | 34 +++++++++++++++++++++
+ src/RembrandtGfx/rmb.hpp        |  2 +-
+ 4 files changed, 88 insertions(+), 5 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 46b13a9..4025fc3 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3476,12 +3476,50 @@ mach_vm_address_t gfbOrgGetAttr, gfbOrgSetAttr;
+ 
+ // WindowServer may open the stubs before stage4aOpen samples (boot of 25/11 14:41: three opens at
+ // 44.87 s, before the kext's own): sample here once if needed, inside the first enableController.
+-IOReturn enable() {
++// Patch 0028b. Boots of 25/11 22:42/22:44 panicked in IOAccelDisplayMachine::display_mode_did_change
++// ("driver returns false"). Read in the 15.8.1 binaries: AMDGraphicsAccelerator::reserveNDRVSpace
++// reserves [VRAM base, +S) for the firmware console (S = getAttribute('fbrs') when it succeeds with a
++// non-zero value, else hw->0x1d8()) and a 0xa000000 block right after it (accel+0x1ee0).
++// AMDAccelDisplayMachine::set_display_mode_and_vram frees that block and reserves the macOS screen at
++// VRAM base + "ATY,fb_offset", size max(computed, "ATY,fb_size") (AMDHWDisplay::getDisplayInfo
++// +0x190/+0x1db, 8-byte OSData read with movq / movl); a second failure returns false = panic. Apple's
++// AmdRadeonFramebuffer::setDisplayMode publishes both properties (+0x522/+0x541, 8 bytes each) and
++// "ATY,fb_linebytes" (4 bytes); the routed setDisplayMode does not, so the offset was 0, on top of the
++// console reservation. AMDHWDisplay::isDisplayEnabled also needs a non-zero "ATY,fb_size".
++// Answer 'fbrs' with a constant (it is asked before the mode is sampled) and place the screen right
++// after it: S <= offset, offset + size <= S + 0xa000000. No register is written: the HUBP0 keeps
++// scanning out the console at VRAM offset 0 (aperture unchanged, BAR0 + 0); the accelerator's own
++// screen resource sits at VRAM + 16 MB until patch 0029 points the HUBP0 at it.
++constexpr uint64_t NdrvReserve = 0x1000000, FbOffset = 0x1000000;
++void publishFbProps(void *fb) {
++	static bool done;
++	if (done || fbIndex(fb) != 0 || !gMode.ok)
++		return;
++	done = true;
++	auto svc = static_cast<IOService *>(fb);
++	uint64_t off = FbOffset, size = (static_cast<uint64_t>(gMode.rowBytes) * gMode.h + PAGE_MASK) & ~static_cast<uint64_t>(PAGE_MASK);
++	uint32_t line = gMode.rowBytes;
++	auto set = [&](const char *key, const void *bytes, unsigned len) {
++		if (auto d = OSData::withBytes(bytes, len)) {
++			svc->setProperty(key, d);
++			d->release();
++		}
++	};
++	set("ATY,fb_offset", &off, sizeof(off));
++	set("ATY,fb_size", &size, sizeof(size));
++	set("ATY,fb_linebytes", &line, sizeof(line));
++	LOG("gopfb: fb0 ATY,fb_offset %llx ATY,fb_size %llx ATY,fb_linebytes %u ('fbrs' answers %llx; fits the freed block: %s)", off,
++	    size, line, NdrvReserve, off >= NdrvReserve && off + size <= NdrvReserve + 0xa000000 ? "yes" : "NO");
++}
++
++IOReturn enable(void *fb) {
+ 	static bool sampled;
+ 	if (gOn && gRouted && !gMode.ok && !sampled) {
+ 		sampled = true;
+ 		sample(true);
+ 	}
++	if (gOn && gRouted && gMode.ok)
++		publishFbProps(fb);  // before IOFramebuffer::open delivers the mode change (after enableController)
+ 	return gOn && gRouted && gMode.ok ? kIOReturnSuccess : kIOReturnUnsupported;
+ }
+ 
+@@ -3678,6 +3716,17 @@ IOReturn getAttribute(void *fb, IOSelect sel, uintptr_t *value) {
+ 	first(23, "getAttribute", fb, sel);
+ 	if (sel == 'amtr')
+ 		return gTxnPending[fbIndex(fb) & 3] ? kIOReturnNotReady : kIOReturnSuccess;  // *value untouched, as Apple's
++	if (sel == 'fbrs') {  // patch 0028b: size of the console reservation (reserveNDRVSpace), see publishFbProps
++		if (!value)
++			return kIOReturnBadArgument;
++		*value = NdrvReserve;
++		static bool once;
++		if (!once) {
++			once = true;
++			LOG("gopfb: getAttribute(fb%d, 'fbrs') -> %llx", fbIndex(fb), NdrvReserve);
++		}
++		return kIOReturnSuccess;
++	}
+ 	static IOSelect logged[32];
+ 	static uint32_t n;
+ 	bool known = false;
+@@ -3764,7 +3813,7 @@ IOReturn setInterruptState(void *fb, void *ref, UInt32 state) {
+ }  // namespace gopfb
+ 
+ bool displayGopFbOn() { return gopfb::gOn; }
+-IOReturn displayGopFbEnable() { return gopfb::enable(); }
++IOReturn displayGopFbEnable(void *fb) { return gopfb::enable(fb); }
+ 
+ // rmbstage=3 -rmbfbstubs -rmbgopfb: route the stub virtuals. Without the argument nothing is routed.
+ void displayRouteGopFb(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index dffa234..7079780 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -264,7 +264,7 @@ static uint64_t wrapFbEnableControllerRefused(uint64_t fb, uint64_t, uint64_t, u
+ 	// Patch 0028: with -rmbgopfb every stub reports success (CoreDisplay needs all of them open);
+ 	// fb 0 serves the inherited mode, the others are offline (display.cpp gopfb). Apple's DAL still
+ 	// does not run and nothing is written. Without the argument, or with a route missing, as 0027.
+-	if (displayGopFbOn() && displayGopFbEnable() == kIOReturnSuccess) {
++	if (displayGopFbOn() && displayGopFbEnable(reinterpret_cast<void *>(fb)) == kIOReturnSuccess) {
+ 		LOG("gopfb: AmdRadeonFramebuffer::enableController -> success without Apple's DAL (call %u, %u framebuffers, location %s)",
+ 		    calls, fbs, reinterpret_cast<IOService *>(fb)->getLocation() ? reinterpret_cast<IOService *>(fb)->getLocation() : "?");
+ 		return kIOReturnSuccess;
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0028, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0028b, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/probe.cpp b/src/RembrandtGfx/probe.cpp
+index 1f9f781..7c25809 100644
+--- a/src/RembrandtGfx/probe.cpp
++++ b/src/RembrandtGfx/probe.cpp
+@@ -982,6 +982,33 @@ uint64_t wrapAccelSubmitScan(uint64_t self, uint64_t desc) {
+ 	return reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(orgAccelSubmitCommands)(self, desc);
+ }
+ 
++// Patch 0028b (-rmbgopfb only), measurement. AMDHWDisplay::getDisplayInfo(idx, b, b, fb, info) fills
++// the _FRAMEBUFFER_INFO that set_display_mode_and_vram reserves from: +0 VRAM offset ("ATY,fb_offset"),
++// +8 computed size, +0xc "ATY,fb_size". displayModeDidChange returning false makes IOAcceleratorFamily2
++// panic (IOAccelDisplayMachine.cpp:345); the two 0028 boots lost the end of the log, so wait 3 s
++// before passing the false on. It is not a forced accept: the panic happens all the same.
++mach_vm_address_t orgGetDisplayInfo, orgDisplayModeDidChange;
++uint64_t wrapGetDisplayInfo(uint64_t self, uint64_t idx, uint64_t b1, uint64_t b2, uint64_t fb, uint64_t info) {
++	auto r = reinterpret_cast<Fn6>(orgGetDisplayInfo)(self, idx, b1, b2, fb, info);
++	static uint32_t n;
++	if (info && n++ < 12) {
++		auto q = reinterpret_cast<const uint32_t *>(info);
++		LOG("gopfb: getDisplayInfo(%u, %u, %u) = %u: info %08x_%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", static_cast<uint32_t>(idx),
++		    static_cast<uint32_t>(b1 & 0xff), static_cast<uint32_t>(b2 & 0xff), static_cast<uint32_t>(r & 0xff), q[1], q[0], q[2], q[3], q[4], q[5],
++		    q[6], q[7], q[8], q[9], q[10], q[11]);
++	}
++	return r;
++}
++uint64_t wrapDisplayModeDidChange(uint64_t self, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	auto r = reinterpret_cast<Fn6>(orgDisplayModeDidChange)(self, b, c, d, e, f);
++	LOG("gopfb: AMDAccelDisplayMachine::displayModeDidChange = %u", static_cast<uint32_t>(r & 0xff));
++	if (!(r & 0xff)) {
++		LOG("gopfb: displayModeDidChange FALSE: IOAcceleratorFamily2 will panic; waiting 3 s so this log reaches the disk");
++		IOSleep(3000);
++	}
++	return r;
++}
++
+ void probeRouteAccel(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	gAccelBase = address;
+ 	gKeepScanoutDcc = checkKernelArgument("-rmbscandcc");
+@@ -1017,6 +1044,13 @@ void probeRouteAccel(KernelPatcher &patcher, size_t index, mach_vm_address_t add
+ 		{"__ZN35AMDRadeonX6000_AMDAtomicBlitManager8doExpandEP15_UBM_EXPANDINFOPK11ABM_OPTIONS", wrapUbmOp<&orgDoExpand, 'E'>, orgDoExpand},
+ 	};
+ 	route(patcher, index, address, size, reqs, arrsize(reqs));
++	if (checkKernelArgument("-rmbgopfb")) {  // patch 0028b: measurement only
++		KernelPatcher::RouteRequest gr[] {
++			{"__ZN27AMDRadeonX6000_AMDHWDisplay14getDisplayInfoEjbbPvP17_FRAMEBUFFER_INFO", wrapGetDisplayInfo, orgGetDisplayInfo},
++			{"__ZN37AMDRadeonX6000_AMDAccelDisplayMachine20displayModeDidChangeEv", wrapDisplayModeDidChange, orgDisplayModeDidChange},
++		};
++		route(patcher, index, address, size, gr, arrsize(gr));
++	}
+ 	if (checkKernelArgument("-rmbnosubmit")) {
+ 		KernelPatcher::RouteRequest req {"__ZN30AMDRadeonX6000_AMDAccelChannel14submitCommandsEP24IOAccelCommandDescriptor",
+ 			wrapAccelSubmitCommands, orgAccelSubmitCommands};
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index bd14ef7..c51aa9a 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -136,7 +136,7 @@ void displayGopCensus(const char *when);
+ // Patch 0028 (-rmbgopfb): the stubs serve the firmware-lit mode (routes, VBL/transaction timer).
+ void displayRouteGopFb(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+ bool displayGopFbOn();
+-IOReturn displayGopFbEnable();  // kIOReturnSuccess once routed and the inherited mode is usable
++IOReturn displayGopFbEnable(void *fb);  // kIOReturnSuccess once routed and the inherited mode is usable
+ // Patch 0026: stops the interrupt ring and the MSI source if the kext started them (power handler).
+ void irqStopForShutdown(const char *why);
+ // Patch 0025: turns the interrupt rings off, whatever the stage (rmb-irq watchdog only).
+-- 
+2.39.5 (Apple Git-154)
+

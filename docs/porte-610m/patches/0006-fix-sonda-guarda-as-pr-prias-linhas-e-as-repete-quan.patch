@@ -1,0 +1,316 @@
+From 0b72555b42861281019abebea8c4bb182a39bea4 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Mon, 23 Nov 2026 00:54:40 +0000
+Subject: [PATCH 06/48] =?UTF-8?q?fix:=20sonda=20guarda=20as=20pr=C3=B3pria?=
+ =?UTF-8?q?s=20linhas=20e=20as=20repete=20quando=20o=20log=20em=20disco=20?=
+ =?UTF-8?q?abre?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No 82X5 com o 15.8.1 só as últimas 14 das cerca de 45 linhas da sonda
+chegaram ao disco: elas saem no primeiro segundo, o msgbuf do boot ainda
+é o pequeno, e o disklog só abre o arquivo segundos depois.
+
+Cada linha da sonda agora também fica numa área própria de 12 KiB, e o
+disklog chama ipDiscReplay() uma vez, logo depois de abrir o arquivo. As
+linhas repetidas saem com a marca "replay:".
+---
+ src/RembrandtGfx/disklog.cpp |  2 +
+ src/RembrandtGfx/ipdisc.cpp  | 99 +++++++++++++++++++++++++-----------
+ src/RembrandtGfx/rmb.hpp     |  1 +
+ 3 files changed, 72 insertions(+), 30 deletions(-)
+
+diff --git a/src/RembrandtGfx/disklog.cpp b/src/RembrandtGfx/disklog.cpp
+index 67b616b..d3aa7e4 100644
+--- a/src/RembrandtGfx/disklog.cpp
++++ b/src/RembrandtGfx/disklog.cpp
+@@ -125,6 +125,8 @@ void diskLogThread(void *, wait_result_t) {
+ 			uint64_t ns;
+ 			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+ 			gOpenMs = ns / 1000000;
++			if (rmbProbe())
++				ipDiscReplay();  // the probe lines again, now that they can reach the disk
+ 		} else if (x == last && !closing) {
+ 			gBusyAt = 0;
+ 			gSyncDone = req;
+diff --git a/src/RembrandtGfx/ipdisc.cpp b/src/RembrandtGfx/ipdisc.cpp
+index cc37906..943e584 100644
+--- a/src/RembrandtGfx/ipdisc.cpp
++++ b/src/RembrandtGfx/ipdisc.cpp
+@@ -39,6 +39,7 @@
+ //
+ 
+ #include "rmb.hpp"
++#include <stdarg.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IODeviceMemory.h>
+@@ -67,6 +68,27 @@ bool rmbProbe() { return rmbStage() != 0; }
+ 
+ namespace {
+ 
++// 82X5, 15.8.1, 2026-11-22: only the last 14 of the ~45 probe lines reached the disk. They are printed in
++// the first second, the boot msgbuf is still the small one, and disklog.cpp opens its file seconds later.
++// Every probe line is therefore also kept here, and ipDiscReplay() prints them again once the file is open.
++char gSaved[12288];
++uint32_t gSavedLen;
++void plog(const char *fmt, ...) __printflike(1, 2);
++void plog(const char *fmt, ...) {
++	char line[400];
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	printf("RembrandtGfx: %s\n", line);
++	size_t n = strlen(line);
++	if (gSavedLen + n + 1 <= sizeof(gSaved)) {
++		memcpy(gSaved + gSavedLen, line, n);
++		gSavedLen += static_cast<uint32_t>(n);
++		gSaved[gSavedLen++] = '\n';
++	}
++}
++
+ constexpr uint32_t RegMemSize = 0xde3, RegFbOffset = 0x1260 + 0x16e7;      // dword indices, read only
+ constexpr uint32_t RegMmIndex = 0x0, RegMmIndexHi = 0x6, RegMmData = 0x1;  // index, index hi: written; data: read
+ constexpr uint32_t BinSize = 10 << 10, BinTop = 64 << 10;                   // DISCOVERY_TMR_SIZE, _OFFSET
+@@ -136,43 +158,43 @@ void mmCopy(Regs &r, uint64_t pos, uint32_t &idx, uint32_t &hi) {
+ void parse(uint64_t pos) {
+ 	gIpCount = 0;
+ 	if (gLen < 4 || le32(0) != BinSig) {
+-		LOG("probe: FAIL no binary signature at VRAM offset %llx: first word %08x (want %08x), %u bytes read", pos,
++		plog("probe: FAIL no binary signature at VRAM offset %llx: first word %08x (want %08x), %u bytes read", pos,
+ 		    le32(0), BinSig, gLen);
+ 		return;
+ 	}
+ 	uint32_t size = le16(10), sum = le16(8), tOff = le16(12), tSum = le16(14);
+ 	if (size < 20 || size > gLen || byteSum(10, size - 10) != sum) {
+-		LOG("probe: FAIL binary size %u checksum %04x (computed %04x), %u bytes read", size, sum,
++		plog("probe: FAIL binary size %u checksum %04x (computed %04x), %u bytes read", size, sum,
+ 		    size >= 20 && size <= gLen ? byteSum(10, size - 10) : 0, gLen);
+ 		return;
+ 	}
+ 	if (!tOff || !inBin(tOff, 80) || le32(tOff) != TableSig) {
+-		LOG("probe: FAIL ip table at +%x: signature %08x (want %08x)", tOff, inBin(tOff, 4) ? le32(tOff) : 0, TableSig);
++		plog("probe: FAIL ip table at +%x: signature %08x (want %08x)", tOff, inBin(tOff, 4) ? le32(tOff) : 0, TableSig);
+ 		return;
+ 	}
+ 	uint32_t tSize = le16(tOff + 6), dies = le16(tOff + 12);
+ 	bool b64 = gBin[tOff + 78] & 1;
+ 	if (tSize < 80 || !inBin(tOff, tSize) || byteSum(tOff, tSize) != tSum || dies > MaxDies) {
+-		LOG("probe: FAIL ip table size %u checksum %04x (computed %04x) dies %u", tSize, tSum,
++		plog("probe: FAIL ip table size %u checksum %04x (computed %04x) dies %u", tSize, tSum,
+ 		    tSize >= 80 && inBin(tOff, tSize) ? byteSum(tOff, tSize) : 0, dies);
+ 		return;
+ 	}
+-	LOG("probe: discovery binary at VRAM offset %llx: v%u.%u size %u; ip table +%x v%u size %u dies %u base64 %u, checksums ok",
++	plog("probe: discovery binary at VRAM offset %llx: v%u.%u size %u; ip table +%x v%u size %u dies %u base64 %u, checksums ok",
+ 	    pos, le16(4), le16(6), size, tOff, le16(tOff + 4), tSize, dies, b64);
+ 	uint32_t total = 0;
+ 	for (uint32_t d = 0; d < dies; d++) {
+ 		uint32_t dOff = le16(tOff + 14 + d * 4 + 2);
+ 		if (!inBin(dOff, 4) || le16(dOff + 2) > MaxIps) {
+-			LOG("probe: FAIL die %u header at +%x: outside the %u bytes read or num_ips %u > %u", d, dOff, gLen,
++			plog("probe: FAIL die %u header at +%x: outside the %u bytes read or num_ips %u > %u", d, dOff, gLen,
+ 			    inBin(dOff, 4) ? le16(dOff + 2) : 0, MaxIps);
+ 			return;
+ 		}
+ 		uint32_t ips = le16(dOff + 2), off = dOff + 4;
+-		LOG("probe: die %u id %u at +%x num_ips %u", d, le16(dOff), dOff, ips);
++		plog("probe: die %u id %u at +%x num_ips %u", d, le16(dOff), dOff, ips);
+ 		for (uint32_t i = 0; i < ips; i++, total++) {
+ 			uint32_t nb = inBin(off, 8) ? gBin[off + 3] : 0, len = 8 + nb * (b64 ? 8 : 4);
+ 			if (!inBin(off, len)) {
+-				LOG("probe: FAIL die %u ip %u at +%x (%u bases) is outside the %u bytes read", d, i, off, nb, gLen);
++				plog("probe: FAIL die %u ip %u at +%x (%u bases) is outside the %u bytes read", d, i, off, nb, gLen);
+ 				return;
+ 			}
+ 			char bases[MaxBases * 11 + 1];
+@@ -181,7 +203,7 @@ void parse(uint64_t pos) {
+ 			for (uint32_t b = 0; b < nb && b < MaxBases; b++)
+ 				k += snprintf(bases + k, sizeof(bases) - k, "%s0x%08X", b ? " " : "",
+ 				              b64 ? le32(off + 8 + b * 8) & 0x3FFFFFFF : le32(off + 8 + b * 4));
+-			LOG("probe: ip die%u %u/%u hw_id=%u v=%u.%u.%u bases=%s%s", d, le16(off), gBin[off + 2], le16(off),
++			plog("probe: ip die%u %u/%u hw_id=%u v=%u.%u.%u bases=%s%s", d, le16(off), gBin[off + 2], le16(off),
+ 			    gBin[off + 4], gBin[off + 5], gBin[off + 6], bases, nb > MaxBases ? " ..." : "");
+ 			if (total < MaxRecs) {
+ 				auto base = [&](uint32_t b) { return b >= nb ? 0 : b64 ? le32(off + 8 + b * 8) & 0x3FFFFFFF : le32(off + 8 + b * 4); };
+@@ -191,7 +213,7 @@ void parse(uint64_t pos) {
+ 		}
+ 	}
+ 	gIpCount = total < MaxRecs ? total : MaxRecs;
+-	LOG("probe: OK %u dies, %u ips listed", dies, total);
++	plog("probe: OK %u dies, %u ips listed", dies, total);
+ }
+ 
+ uint32_t dataU32(IORegistryEntry *e, const char *key) {
+@@ -225,7 +247,7 @@ bool mmRead(IOMemoryDescriptor *mem, uint64_t pos) {
+ 	mmCopy(r, pos, idx, hi);
+ 	uint32_t idxNow = r[RegMmIndex], hiNow = r[RegMmIndexHi];
+ 	map->release();
+-	LOG("probe: MM_INDEX %08x MM_INDEX_HI %08x saved, %u bytes read at VRAM offset %llx, now %08x %08x: %s", idx, hi,
++	plog("probe: MM_INDEX %08x MM_INDEX_HI %08x saved, %u bytes read at VRAM offset %llx, now %08x %08x: %s", idx, hi,
+ 	    gLen, pos, idxNow, hiNow, idxNow == idx && hiNow == hi ? "restored" : "RESTORE MISMATCH");
+ 	return true;
+ }
+@@ -238,13 +260,13 @@ void physPeek(uint64_t pa) {
+ 	if (md)
+ 		md->release();
+ 	if (!map) {
+-		LOG("probe: cross-check: could not map phys %llx read-only", pa);
++		plog("probe: cross-check: could not map phys %llx read-only", pa);
+ 		return;
+ 	}
+ 	auto p = reinterpret_cast<const volatile uint32_t *>(map->getVirtualAddress());
+ 	uint32_t w[4] {p[0], p[1], p[2], p[3]};
+ 	map->release();
+-	LOG("probe: cross-check: CPU read of phys %llx gives %08x %08x %08x %08x (Linux: ffffffff, region closed to the CPU)",
++	plog("probe: cross-check: CPU read of phys %llx gives %08x %08x %08x %08x (Linux: ffffffff, region closed to the CPU)",
+ 	    pa, w[0], w[1], w[2], w[3]);
+ }
+ 
+@@ -266,12 +288,12 @@ void probe(IOService *svc, bool retry) {
+ 	uint32_t id = pci->configRead32(sp, static_cast<UInt8>(kIOPCIConfigVendorID)), bar[6];
+ 	uint16_t cmd = pci->configRead16(sp, static_cast<UInt8>(kIOPCIConfigCommand));
+ 	bool mem = cmd & kIOPCICommandMemorySpace;
+-	LOG("probe: %04x:%04x rev %02x at %02x:%02x.%x command %04x (memory decode %s)%s", id & 0xFFFF, id >> 16,
++	plog("probe: %04x:%04x rev %02x at %02x:%02x.%x command %04x (memory decode %s)%s", id & 0xFFFF, id >> 16,
+ 	    pci->configRead8(sp, static_cast<UInt8>(kIOPCIConfigRevisionID)), sp.s.busNum, sp.s.deviceNum,
+ 	    sp.s.functionNum, cmd, mem ? "on" : "OFF", retry ? ", retry +20 s" : "");
+ 	for (uint32_t i = 0; i < 6; i++)
+ 		bar[i] = pci->configRead32(sp, static_cast<UInt8>(kIOPCIConfigBaseAddress0 + i * 4));
+-	LOG("probe: BAR0-5 %08x %08x %08x %08x %08x %08x", bar[0], bar[1], bar[2], bar[3], bar[4], bar[5]);
++	plog("probe: BAR0-5 %08x %08x %08x %08x %08x %08x", bar[0], bar[1], bar[2], bar[3], bar[4], bar[5]);
+ 	IOMemoryDescriptor *regs = nullptr;
+ 	// 82X5, M1 boot 2 (2026-11-20): no "device memory" line at all. IOPCIFamily builds the list in
+ 	// IOPCIDevice::getResources(), which IOKit calls when a driver is about to probe the nub, and no
+@@ -280,26 +302,26 @@ void probe(IOService *svc, bool retry) {
+ 	// device-id) and IOKit builds the list for them, so this file must not get ahead of that.
+ 	if (!svc->getDeviceMemoryCount() && rmbStage() == 1) {
+ 		IOReturn r = svc->getResources();
+-		LOG("probe: no device memory yet, getResources = %x, %u entries now", r, svc->getDeviceMemoryCount());
++		plog("probe: no device memory yet, getResources = %x, %u entries now", r, svc->getDeviceMemoryCount());
+ 	} else if (!svc->getDeviceMemoryCount())
+-		LOG("probe: no device memory yet, getResources not called at stage %u", rmbStage());
++		plog("probe: no device memory yet, getResources not called at stage %u", rmbStage());
+ 	for (uint32_t i = 0; i < svc->getDeviceMemoryCount() && i < 8; i++) {
+ 		auto m = svc->getDeviceMemoryWithIndex(i);
+ 		if (!m)
+ 			continue;
+ 		uint64_t pa = m->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+-		LOG("probe: device memory %u: phys %llx length %llx", i, pa, static_cast<uint64_t>(m->getLength()));
++		plog("probe: device memory %u: phys %llx length %llx", i, pa, static_cast<uint64_t>(m->getLength()));
+ 		if (!regs && bar[5] && !(bar[5] & 7) && pa == (bar[5] & ~0xFULL))  // BAR 5: 32-bit memory BAR
+ 			regs = m;
+ 	}
+ 	if (id != 0x15061002) {
+-		LOG("probe: not 1002:1506, registers not touched");
++		plog("probe: not 1002:1506, registers not touched");
+ 		return;
+ 	}
+ 	if (!mem) {
+ 		// The retry is for stage 1 only: at stage 2 Apple's kexts own MM_INDEX by then.
+ 		bool again = !retry && rmbStage() == 1;
+-		LOG("probe: memory decode is off, registers not touched%s", again ? "; one retry in 20 s" : "");
++		plog("probe: memory decode is off, registers not touched%s", again ? "; one retry in 20 s" : "");
+ 		thread_t t;
+ 		if (!again)
+ 			return;
+@@ -316,13 +338,13 @@ void probe(IOService *svc, bool retry) {
+ 	IOMemoryDescriptor *own = nullptr;
+ 	if (!regs && bar[5] && !(bar[5] & 7)) {
+ 		regs = own = IOMemoryDescriptor::withPhysicalAddress(bar[5] & ~0xFULL, 0x10000, kIODirectionInOut);
+-		LOG("probe: BAR 5 not in the device memory list, using phys %llx length 10000 directly%s",
++		plog("probe: BAR 5 not in the device memory list, using phys %llx length 10000 directly%s",
+ 		    static_cast<uint64_t>(bar[5] & ~0xFULL), regs ? "" : ": FAILED");
+ 	}
+ 	if (regs)
+ 		readTable(regs, bar[5]);
+ 	else
+-		LOG("probe: FAIL register BAR 5 (%08x) has no device memory", bar[5]);
++		plog("probe: FAIL register BAR 5 (%08x) has no device memory", bar[5]);
+ 	if (own)
+ 		own->release();
+ }
+@@ -331,29 +353,46 @@ void probe(IOService *svc, bool retry) {
+ void readTable(IOMemoryDescriptor *regs, uint32_t bar5) {
+ 	uint32_t memSize = 0, fbOff = 0;
+ 	if (!regRead(regs, RegMemSize, memSize) || !regRead(regs, RegFbOffset, fbOff)) {
+-		LOG("probe: FAIL register BAR 5 (%08x) too small or not mappable", bar5);
++		plog("probe: FAIL register BAR 5 (%08x) too small or not mappable", bar5);
+ 		return;
+ 	}
+-	LOG("probe: RCC_CONFIG_MEMSIZE %08x (MB) GCMC_VM_FB_OFFSET %08x", memSize, fbOff);
++	plog("probe: RCC_CONFIG_MEMSIZE %08x (MB) GCMC_VM_FB_OFFSET %08x", memSize, fbOff);
+ 	if (!memSize || memSize > 0x10000) {
+-		LOG("probe: FAIL implausible RCC_CONFIG_MEMSIZE, nothing written");
++		plog("probe: FAIL implausible RCC_CONFIG_MEMSIZE, nothing written");
+ 		return;
+ 	}
+ 	uint64_t pos = (static_cast<uint64_t>(memSize) << 20) - BinTop;
+ 	if (checkKernelArgument("-rmbprobero"))
+-		LOG("probe: -rmbprobero: MM_INDEX not touched, table at VRAM offset %llx not read", pos);
++		plog("probe: -rmbprobero: MM_INDEX not touched, table at VRAM offset %llx not read", pos);
+ 	else if (!mmRead(regs, pos))
+-		LOG("probe: FAIL could not map page 0 of the register BAR, nothing written");
++		plog("probe: FAIL could not map page 0 of the register BAR, nothing written");
+ 	else
+ 		parse(pos);
+ 	if (fbOff != 0xFFFFFFFF && (fbOff & 0xFFFFFF))
+ 		physPeek((static_cast<uint64_t>(fbOff & 0xFFFFFF) << 24) + pos);
+ 	else
+-		LOG("probe: cross-check skipped, implausible GCMC_VM_FB_OFFSET");
++		plog("probe: cross-check skipped, implausible GCMC_VM_FB_OFFSET");
+ }
+ 
+ }  // namespace
+ 
++// Called by disklog.cpp once, right after its file is open. Prints the saved lines again with a "replay:"
++// mark, so the disk log has the whole probe even when the boot msgbuf dropped its first lines.
++void ipDiscReplay() {
++	if (!gSavedLen)
++		return;
++	printf("RembrandtGfx: probe: replay of the %u bytes of probe lines follows\n", gSavedLen);
++	for (uint32_t i = 0, start = 0; i < gSavedLen; i++) {
++		if (gSaved[i] != '\n')
++			continue;
++		gSaved[i] = 0;
++		printf("RembrandtGfx: replay: %s\n", gSaved + start);
++		gSaved[i] = '\n';
++		start = i + 1;
++	}
++	printf("RembrandtGfx: probe: replay end\n");
++}
++
+ void ipDiscProbe(IOService *svc) {
+ 	probe(svc, false);
+ }
+@@ -365,11 +404,11 @@ bool ipDiscIs(uint32_t hwId, uint32_t major, uint32_t minor, uint32_t rev, uint3
+ 		auto &ip = gIps[i];
+ 		if (ip.hw != hwId || ip.inst != 0)
+ 			continue;
+-		LOG("stage 3 preflight: table has hw_id %u v%u.%u.%u bases %x %x (%u), want v%u.%u.%u bases %x %x", hwId, ip.major,
++		plog("stage 3 preflight: table has hw_id %u v%u.%u.%u bases %x %x (%u), want v%u.%u.%u bases %x %x", hwId, ip.major,
+ 		    ip.minor, ip.rev, ip.base[0], ip.base[1], ip.bases, major, minor, rev, base0, base1);
+ 		return ip.major == major && ip.minor == minor && ip.rev == rev && (base0 == ~0u || (ip.bases >= 1 && ip.base[0] == base0)) &&
+ 		       (base1 == ~0u || (ip.bases >= 2 && ip.base[1] == base1));
+ 	}
+-	LOG("stage 3 preflight: hw_id %u not in the table read at this boot (%u ips recorded)", hwId, gIpCount);
++	plog("stage 3 preflight: hw_id %u not in the table read at this boot (%u ips recorded)", hwId, gIpCount);
+ 	return false;
+ }
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 3b1653d..91bc606 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -42,6 +42,7 @@ bool firmwareReady(const char *set);
+ uint32_t gcHwVersion();
+ class IOService;
+ void ipDiscProbe(IOService *svc);
++void ipDiscReplay();
+ void safeModesLog();
+ // display.cpp: inject one DMUB inbox command (reply = slot contents after the fw consumed it); DAL link of the
+ // external DP/HDMI stream (0 = none).
+-- 
+2.39.5 (Apple Git-154)
+

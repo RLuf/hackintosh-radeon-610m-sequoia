@@ -1,0 +1,232 @@
+From 7c8b3cbcdaf87141893f7346dfc7493b0a156c4e Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 06:14:21 -0300
+Subject: [PATCH 39/48] -rmbpcalloc7e: GE_PC_ALLOC 0x7e como o Mesa na
+ Mendocino; -rmbsmuclk: GFXCLK/FCLK do PMFW (0035)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ src/RembrandtGfx/probe.cpp      |  3 ++-
+ src/RembrandtGfx/rmb.hpp        |  4 +++-
+ src/RembrandtGfx/smu.cpp        | 24 +++++++++++++++++++++-
+ src/RembrandtGfx/umdpatch.cpp   | 36 +++++++++++++++++++++++----------
+ 5 files changed, 54 insertions(+), 15 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index f9ebbf2..d258701 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0034, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0035, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/probe.cpp b/src/RembrandtGfx/probe.cpp
+index 5760883..4939f73 100644
+--- a/src/RembrandtGfx/probe.cpp
++++ b/src/RembrandtGfx/probe.cpp
+@@ -207,11 +207,12 @@ uint64_t wrapMemComplete(uint64_t self, uint64_t res, uint64_t c, uint64_t d, ui
+ uint64_t wrapResetHardware(uint64_t self, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	LOG("hw-reset: resetHardware(%llx)", b);
+ 	static uint32_t dumps;
+-	if ((gCarveRead || gWaveDump) && dumps++ < 3) {
++	if ((gCarveRead || gWaveDump || checkKernelArgument("-rmbsmuclk")) && dumps++ < 3) {
+ 		if (gWaveDump)
+ 			waveDump("hang");  // first: before anything else touches the chip
+ 		if (gCarveRead)
+ 			shaderDump("hang");
++		smuClockLog("hang");  // patch 0035, no-op without -rmbsmuclk
+ 	}
+ 	auto r = reinterpret_cast<Fn6>(orgResetHardware)(self, b, c, d, e, f);
+ 	syncSdmaAddrConfig("after resetHardware");
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 5e2c54c..b2f2214 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -188,7 +188,9 @@ void ptScan(const char *why);
+ void ptScanVmid(uint32_t vmid, bool quietIfSame = false);
+ uint64_t ptVmidBase(uint32_t vmid);
+ void shaderDump(const char *why);  // patch 0033: shader code at a hang, HDP flush remap
+-void waveDump(const char *why);  // patch 0034: live wave state (PC, STATUS, counters) at a hang
++void waveDump(const char *why);
++void smuClockLog(const char *why);  // patch 0035 (-rmbsmuclk): GFXCLK/FCLK from the PMFW
++void smuClockInit();  // patch 0034: live wave state (PC, STATUS, counters) at a hang
+ extern bool gWaveDump;  // -rmbwavedump
+ void mmhubDump(const char *why);  // 0 when the context is disabled
+ void gartCensus(const char *when);
+diff --git a/src/RembrandtGfx/smu.cpp b/src/RembrandtGfx/smu.cpp
+index ad9f050..193e4db 100644
+--- a/src/RembrandtGfx/smu.cpp
++++ b/src/RembrandtGfx/smu.cpp
+@@ -19,7 +19,12 @@ enum : uint32_t {
+ 	PPSMC_MSG_GetSmuVersion = 0x02,
+ 	PPSMC_MSG_GfxDeviceDriverReset = 0x11,
+ 	PPSMC_MSG_DisallowGfxOff = 0x1A,
++	// Patch 0035 (-rmbsmuclk): read-only queries, smu_v13_0_1_ppsmc.h:67-68 (SMU 13.0.8 = yellow_carp_ppt.c,
++	// amdgpu_smu.c:689-692). They return the current clock in MHz in the argument; they change nothing.
++	PPSMC_MSG_GetGfxclkFrequency = 0x17,
++	PPSMC_MSG_GetFclkFrequency = 0x18,
+ };
++bool gSmuClk;
+ 
+ bool waitResp(uint32_t &resp, int ms = 1000) {
+ 	for (int i = 0; i < ms * 100; i++) {
+@@ -39,12 +44,13 @@ uint32_t sendMsg(uint32_t msg, uint32_t &arg, int ms = 1000) {
+ 	uint32_t stage = rmbStage();
+ 	bool armed = stage == 3 && rmbStage3Armed();
+ 	bool allowed = msg == PPSMC_MSG_GetSmuVersion || (armed && msg == PPSMC_MSG_DisallowGfxOff) ||
++	               (armed && gSmuClk && (msg == PPSMC_MSG_GetGfxclkFrequency || msg == PPSMC_MSG_GetFclkFrequency)) ||
+ 	               (armed && msg == PPSMC_MSG_GfxDeviceDriverReset && checkKernelArgument("-rmbmode2"));
+ 	if ((stage == 2 || stage == 3) && !allowed) {
+ 		LOG("smu: stage %u, msg %#x not sent", stage, msg);
+ 		return 0;
+ 	}
+-	if (!waitResp(resp)) {
++	if (!waitResp(resp, ms)) {
+ 		LOG("smu: mailbox busy before msg %#x", msg);
+ 		return 0;
+ 	}
+@@ -130,6 +136,8 @@ uint64_t smuHwInit(uint64_t handle, uint64_t in, uint64_t out, uint64_t, uint64_
+ 	// Keep GFX powered while the PSP/RLC/GC bring-up below us pokes its registers.
+ 	uint32_t arg = 0;
+ 	LOG("smu_hw_init: DisallowGfxOff resp %u", sendMsg(PPSMC_MSG_DisallowGfxOff, arg));
++	if (gSmuClk)
++		smuClockLog("smu_hw_init");
+ 	applyGcGolden();
+ 	startGoldenGuard();
+ 	if (rmbStage() == 3)  // headless: the DMCUB the firmware started keeps running, nobody touches it
+@@ -155,6 +163,19 @@ uint64_t smuSwExit(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+ 
+ }  // namespace
+ 
++// Patch 0035 (-rmbsmuclk): what the PMFW says the GFX and fabric clocks are right now (MHz).
++void smuClockLog(const char *why) {
++	if (!gSmuClk)
++		return;
++	uint32_t g = 0, f = 0;
++	uint32_t rg = sendMsg(PPSMC_MSG_GetGfxclkFrequency, g, 100), rf = sendMsg(PPSMC_MSG_GetFclkFrequency, f, 100);
++	LOG("smuclk %s: GFXCLK %u MHz (resp %u), FCLK %u MHz (resp %u)", why, g, rg, f, rf);
++}
++
++void smuClockInit() {
++	gSmuClk = checkKernelArgument("-rmbsmuclk");
++}
++
+ // Stop the command processors and SDMA the way Linux gfx/sdma hw_fini do (cp_enable/sdma_enable
+ // false), then wait for the GUI to go idle.
+ void haltGfxEngines(const char *why) {
+@@ -221,6 +242,7 @@ void smuStage3BeforeHwInit() {
+ }
+ 
+ void smuRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
++	smuClockInit();  // patch 0035
+ 	KernelPatcher::RouteRequest requests[] {
+ 		{"_smu_sw_init", smuSwInit},
+ 		{"_smu_hw_init", smuHwInit},
+diff --git a/src/RembrandtGfx/umdpatch.cpp b/src/RembrandtGfx/umdpatch.cpp
+index d363e93..206d26a 100644
+--- a/src/RembrandtGfx/umdpatch.cpp
++++ b/src/RembrandtGfx/umdpatch.cpp
+@@ -27,12 +27,12 @@ constexpr size_t xorRepOff = 13;
+ //   amdMtl_GFX10_InitRenderPipelineHwCtxRegs: movq $0x60201b8,0x48(%rbx)  -> 0x60201a8
+ //   Gfx10BltDrawRegs::InitContextRegs:        orl  $0x60201b0,%ecx        -> 0x60201a0
+ struct WfPat {
+-	uint8_t pat[16];
++	uint8_t pat[18];
+ 	size_t len, off;
+ 	uint8_t from, to;
+ 	const char *name;
+-	int arg;  // 0 = -rmbwalkfence2, 1 = -rmbpclines256, 2 = -rmbnobinning (full replacement in rep)
+-	uint8_t rep[16];
++	int arg;  // 0 = -rmbwalkfence2, 1 = -rmbpclines256, 2 = -rmbnobinning, 3 = -rmbpcalloc7e (2, 3: full replacement in rep)
++	uint8_t rep[18];
+ };
+ const WfPat wfPats[] {
+ 	{{0x48, 0xc7, 0x43, 0x48, 0xb8, 0x01, 0x02, 0x06}, 8, 4, 0xb8, 0xa8, "render pipeline", 0},
+@@ -49,8 +49,18 @@ const WfPat wfPats[] {
+ 	{{0xb9, 0x00, 0xe0, 0xff, 0x19, 0xba, 0x00, 0xe0, 0x7f, 0x18, 0x0f, 0x44, 0xd1}, 13, 0, 0, 0,
+ 	 "PA_SC_BINNER_CNTL_0 binning off (mode 2)", 2,
+ 	 {0xb9, 0x02, 0x00, 0xfc, 0x19, 0xba, 0x02, 0x00, 0x7c, 0x18, 0x0f, 0x44, 0xd1}},
++	// Patch 0035 (-rmbpcalloc7e): amdMtl_GFX10_InitStaticHwRegs (0x7ffb08cfb698, 15.8.1) builds GE_PC_ALLOC as
++	//   movl $0x3ff,%eax; andl 0xac(%rdi),%eax; leal 0x1(,%rax,2),%eax; movl %eax,0x10(%rcx)
++	// = (HwInfo+0xac lines << 1) | OVERSUB_EN 1, always (0x3ff in the IB; 0x1ff with -rmbpclines256). Mesa on
++	// the Mendocino (legacy VS) programs 0x7e: pc_lines 256 (ac_gpu_info.c:1403-1406), NUM_PC_LINES(256/4 - 1)
++	// and OVERSUB_EN(late_alloc > 0) = 0, late alloc being 0 for <= 2 CUs/SA (si_state_shaders.cpp:1526,
++	// ac_shader_util.c:998-1000). Apple turns oversubscription on with late alloc 0, only on this chip.
++	// -> movl $0x3f; leal 0x0(,%rax,2): (0x1ff & 0x3f) << 1 = 0x7e. The 18 bytes are unique in the driver.
++	{{0xb8, 0xff, 0x03, 0x00, 0x00, 0x23, 0x87, 0xac, 0x00, 0x00, 0x00, 0x8d, 0x04, 0x45, 0x01, 0x00, 0x00, 0x00}, 18, 0, 0, 0,
++	 "GE_PC_ALLOC 0x3ff -> 0x7e (OVERSUB_EN 0, 64 lines, as Mesa)", 3,
++	 {0xb8, 0x3f, 0x00, 0x00, 0x00, 0x23, 0x87, 0xac, 0x00, 0x00, 0x00, 0x8d, 0x04, 0x45, 0x00, 0x00, 0x00, 0x00}},
+ };
+-bool gDoXor, gDoWf, gDoPc, gDoNoBin;
++bool gDoXor, gDoWf, gDoPc, gDoNoBin, gDoPcAlloc;
+ uint32_t gWfPatched;
+ 
+ mach_vm_address_t orgCsValidateRange;
+@@ -71,7 +81,8 @@ void writeRep(uint8_t *at, const char *how, size_t off) {
+ 
+ void patchWalkFence(uint8_t *p, size_t size) {
+ 	for (auto &w : wfPats) {
+-		if ((w.arg == 0 && !gDoWf) || (w.arg == 1 && !gDoPc) || (w.arg == 2 && !gDoNoBin) || size < w.len)
++		if ((w.arg == 0 && !gDoWf) || (w.arg == 1 && !gDoPc) || (w.arg == 2 && !gDoNoBin) || (w.arg == 3 && !gDoPcAlloc) ||
++		    size < w.len)
+ 			continue;
+ 		for (size_t o = 0, end = size - w.len; o <= end; o++) {
+ 			if (p[o] != w.pat[0] || memcmp(p + o, w.pat, w.len))
+@@ -80,14 +91,15 @@ void patchWalkFence(uint8_t *p, size_t size) {
+ 				LOG("umd: no write access for walk fence patch");
+ 				return;
+ 			}
+-			if (w.arg == 2)
++			if (w.arg >= 2)
+ 				memcpy(p + o, w.rep, w.len);
+ 			else
+ 				p[o + w.off] = w.to;
+ 			MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+ 			if (++gWfPatched <= 8)
+ 				LOG("umd: %s (%s, page off 0x%lx, #%u)",
+-				    w.arg == 2 ? "UpdatePrimBatchBinning" : w.arg ? "HwInfo +0xac" : "PA_SC_MODE_CNTL_1 WALK_FENCE_SIZE 3 -> 2",
++				    w.arg == 3 ? "InitStaticHwRegs" : w.arg == 2 ? "UpdatePrimBatchBinning" : w.arg ? "HwInfo +0xac" :
++				    "PA_SC_MODE_CNTL_1 WALK_FENCE_SIZE 3 -> 2",
+ 				    w.name, (unsigned long)o, gWfPatched);
+ 		}
+ 	}
+@@ -95,7 +107,7 @@ void patchWalkFence(uint8_t *p, size_t size) {
+ 
+ void patchPage(const void *data, size_t size) {
+ 	auto p = static_cast<uint8_t *>(const_cast<void *>(data));
+-	if (p && (gDoWf || gDoPc || gDoNoBin))
++	if (p && (gDoWf || gDoPc || gDoNoBin || gDoPcAlloc))
+ 		patchWalkFence(p, size);
+ 	if (!gDoXor || !p || size < sizeof(xorPat))
+ 		return;
+@@ -139,7 +151,8 @@ void umdRoute(KernelPatcher &patcher) {
+ 	gDoWf = checkKernelArgument("-rmbwalkfence2");  // patch 0030, also in probe stages
+ 	gDoPc = checkKernelArgument("-rmbpclines256");  // patch 0031
+ 	gDoNoBin = checkKernelArgument("-rmbnobinning");  // patch 0032
+-	if (!gDoXor && !gDoWf && !gDoPc && !gDoNoBin)
++	gDoPcAlloc = checkKernelArgument("-rmbpcalloc7e");  // patch 0035 (independent of 0031: other site)
++	if (!gDoXor && !gDoWf && !gDoPc && !gDoNoBin && !gDoPcAlloc)
+ 		return;
+ 	KernelPatcher::RouteRequest req[] {
+ 		{"_cs_validate_page", wrapCsValidatePage, orgCsValidatePage},
+@@ -148,7 +161,8 @@ void umdRoute(KernelPatcher &patcher) {
+ 	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, req, arrsize(req)))
+ 		LOG("umd: failed to route cs_validate_page/range (err %d)", patcher.getError());
+ 	else
+-		LOG("umd: page patch installed (cs_validate_page + range): pipeBankXor 0 %s, walk fence 2 %s, pc lines 256 %s, binning off %s",
+-		    gDoXor ? "on" : "off", gDoWf ? "on" : "off", gDoPc ? "on" : "off", gDoNoBin ? "on" : "off");
++		LOG("umd: page patch installed (cs_validate_page + range): pipeBankXor 0 %s, walk fence 2 %s, pc lines 256 %s, binning off %s, pc alloc 0x7e %s",
++		    gDoXor ? "on" : "off", gDoWf ? "on" : "off", gDoPc ? "on" : "off", gDoNoBin ? "on" : "off",
++		    gDoPcAlloc ? "on" : "off");
+ 	patcher.clearError();
+ }
+-- 
+2.39.5 (Apple Git-154)
+

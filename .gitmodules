@@ -1,0 +1,3 @@
+[submodule "tools/fzmacinstall"]
+	path = tools/fzmacinstall
+	url = https://github.com/RLuf/fzmacinstall.git

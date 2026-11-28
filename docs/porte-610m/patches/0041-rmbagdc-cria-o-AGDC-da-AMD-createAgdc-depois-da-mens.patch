@@ -1,0 +1,80 @@
+From 4517b7230aaeca7c88884d94b48177883c79d32c Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 20:52:24 -0300
+Subject: [PATCH 41/48] -rmbagdc cria o AGDC da AMD (createAgdc) depois da
+ mensagem 6, como no powerUp da Apple (0037)
+
+Sem o AmdAgdcServices o GPUWrangler lista a GPU com agdc 0, o IOPresentment nao monta o mapa e o
+CoreDisplay compoe a tela por software. Desmontagem em ~/fzdrv/rev/pipes/RELATORIO.md.
+
+Co-authored-by: opus-fable
+---
+ src/RembrandtGfx/kern_start.cpp | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 8e542eb..6d3ff6f 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -219,6 +219,28 @@ static void accelState4a(uint64_t ctrl, const char *what, const char *when) {
+ 	    idx >= 16 ? "index out of range, not read" : rq(acc, 0x1a78 + 8 * idx) ? "set" : "NULL");
+ }
+ static uint64_t gCtrl4a;
++// Patch 0037. Measured at the boot of 26/11 19:30 (0035): WindowServer composites in software
++// (CA::OGL::SWContext) because CoreDisplay finds no display pipes: IOPresentmentGetMap gets no entry,
++// since the GPU wrangler lists the GPU with agdc 0 ("Unable to get AGDC information 0x10000003").
++// The AGDC nub (AmdAgdcServices) is created only by AmdRadeonController::createAgdc (c01879a), which
++// Apple calls at the end of AmdRadeonController::powerUp (+0x361), after accelerator message 6; the
++// 4a path never runs powerUp. createAgdc stores the nub in [ctrl+0x7940], then initWithController,
++// attach and start on the PCI device; those read only PCI and AsicInfo fields (no DAL). With
++// -rmbagdc it is called once, right after message 6 succeeds, only if [ctrl+0x7940] is still NULL.
++static mach_vm_address_t orgCreateAgdc;
++static void agdcCreate(uint64_t ctrl) {
++	auto nub = [ctrl] { return *reinterpret_cast<volatile uint64_t *>(ctrl + 0x7940); };
++	if (!orgCreateAgdc) {
++		LOG("agdc: AmdRadeonController::createAgdc not resolved, AGDC not created");
++		return;
++	}
++	if (nub()) {
++		LOG("agdc: [ctrl+0x7940] already set, createAgdc not called");
++		return;
++	}
++	auto r = reinterpret_cast<uint32_t (*)(uint64_t)>(orgCreateAgdc)(ctrl);
++	LOG("agdc: AmdRadeonController::createAgdc = %x; [ctrl+0x7940] %s", r, nub() ? "set" : "NULL");
++}
+ // Patch 0026: with -rmbirqauto the two interrupt steps of patch 0025 run during boot, where Apple's
+ // AmdRadeonController::powerUp runs them: startInterrupts before accelerator message 6 (c01977f,
+ // then c0197e9), and message 0x1b on the enableController of the last framebuffer (c0194cc-c019504,
+@@ -254,6 +276,8 @@ static uint64_t wrapFbEnableControllerRefused(uint64_t fb, uint64_t, uint64_t, u
+ 		LOG("4a: msg6 sent, messageAccelerator(6) = %llx (lo32 %llx)", r, r & 0xFFFFFFFF);
+ 		accelState4a(ctrl, "msg6", "after");
+ 		s3Sample("after msg6");
++		if ((r & 0xFFFFFFFF) == 0 && checkKernelArgument("-rmbagdc"))
++			agdcCreate(ctrl);
+ 	}
+ 	uint32_t fbs = ctrl ? *reinterpret_cast<uint8_t *>(ctrl + 0xbd) : 0;
+ 	if (autoIrq && ctrl && sent && !gMsg1bDone && gIrqOk && gIrqLive && fbs && calls >= fbs) {
+@@ -831,6 +855,11 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 	}
+ 	orgDoesAcceleratorExist = patcher.solveSymbol(index, "__ZNK34AMDRadeonX6000_AmdRadeonController20doesAcceleratorExistEv", address, size);
+ 	patcher.clearError();
++	if (checkKernelArgument("-rmbagdc")) {
++		orgCreateAgdc = patcher.solveSymbol(index, "__ZN34AMDRadeonX6000_AmdRadeonController10createAgdcEv", address, size);
++		LOG("agdc: createAgdc %s", orgCreateAgdc ? "resolved" : "NOT resolved");
++		patcher.clearError();
++	}
+ 	KernelPatcher::RouteRequest req {"__ZNK34AMDRadeonX6000_AmdRadeonController18messageAcceleratorE25_eAMDAccelIOFBRequestTypePvS1_S1_",
+ 		wrapMessageAccelerator, orgMessageAccelerator};
+ 	if (!orgDoesAcceleratorExist || !patcher.routeMultiple(index, &req, 1, address, size))
+@@ -1288,7 +1317,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0036, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0037, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+-- 
+2.39.5 (Apple Git-154)
+

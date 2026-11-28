@@ -1,0 +1,5 @@
+# bytecode Python e metadados do macOS
+__pycache__/
+*.pyc
+.DS_Store
+._*

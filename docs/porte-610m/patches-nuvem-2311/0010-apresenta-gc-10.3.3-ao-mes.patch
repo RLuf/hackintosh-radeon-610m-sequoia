@@ -1,0 +1,80 @@
+From 662b6227876155e260f03f8ed58fc27f1ba18284 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 07:16:10 +0000
+Subject: [PATCH] fix: apresenta a GC 10.3.7 como 10.3.3 ao MES e registra o
+ retorno de mes_sw_init
+
+Com o 0009, GVM, PSP e GC passam e o HWLibs para em "MES init/power-up
+failed". mes_sw_init escolhe o conjunto de funcoes pela versao da GC: de
+10.3.0 a 10.3.5 usa as _mes_*_10_3; de 10.3.6 em diante fica com as
+_mes_*_10_1. A 680M (10.3.3) e a Navi 23 (10.3.4) caem no primeiro grupo;
+a Mendocino (10.3.7) caia no segundo, caminho que nenhuma das duas roda.
+O gancho em mes_get_hw_version apresenta 10.3.7 como 10.3.3. Dois ganchos
+de retorno (mes_sw_init e ttlDevGetDoorbellRange) dizem qual ponto de
+ipi_mes_sw_init falha, se ainda falhar.
+---
+ src/RembrandtGfx/kern_start.cpp | 34 +++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index ce068c2..da15344 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -644,6 +644,35 @@ RESULT_HOOK(vm_sw_init)
+ RESULT_HOOK(hdp_sw_init)
+ RESULT_HOOK(athub_sw_init)
+ 
++// MES takes its function set from the GC version: mes_get_hw_version packs major << 16 | minor << 8 | revision
++// from three 32-bit fields. In 15.8.1 mes_sw_init gives 10.3.0 to 10.3.5 the _mes_*_10_3 functions
++// (leal -0xa0300(%rax), %edx; cmpl $6, %edx; jae) and leaves 10.3.6 and later with the _mes_*_10_1 set.
++// The 680M (10.3.3) and Navi 23 (10.3.4) take the first group. Mendocino's 10.3.7 took the second, a path
++// neither of them runs, and TLS stopped with "MES init/power-up failed" right after gc_sw_init (read from
++// SystemKernelExtensions.kc with kc-le.py dis _mes_sw_init). Present 10.3.7 as 10.3.3, the version the 680M
++// runs there natively. The function is 22 bytes of mov, shl and or: safe to route.
++static mach_vm_address_t org_mes_get_hw_version;
++static uint64_t wrap_mes_get_hw_version(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	auto v = reinterpret_cast<Fn6>(org_mes_get_hw_version)(a, b, c, d, e, f) & 0xFFFFFFFF;
++	static bool logged;
++	if (!logged) {
++		logged = true;
++		LOG("mes_get_hw_version: %llx%s", v, v == 0xa0307 ? ", presenting as 10.3.3" : "");
++	}
++	return v == 0xa0307 ? 0xa0303 : v;
++}
++// ipi_mes_sw_init fails in two places after its own two asserts: mes_sw_init returning an error, or
++// ttlDevGetDoorbellRange returning false. Log both so a second failure names which. Their first 16 bytes
++// are push, mov and sub rsp (kc-le.py dis).
++RESULT_HOOK(mes_sw_init)
++static mach_vm_address_t org_ttlDevGetDoorbellRange;
++static uint64_t wrap_ttlDevGetDoorbellRange(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	auto r = reinterpret_cast<Fn6>(org_ttlDevGetDoorbellRange)(a, b, c, d, e, f);
++	LOG("ttlDevGetDoorbellRange(type %u, count %u) = %u", static_cast<uint32_t>(b), static_cast<uint32_t>(c),
++		static_cast<uint32_t>(r & 0xFF));
++	return r;
++}
++
+ // DeviceCapabilityTbl is keyed by (device id, internal revision, external/PCI revision). All
+ // Navi 23 (0x73FF) rows have internal revision 0; Rembrandt reports its own, so no row matches.
+ // Look up the Navi 23 row with internal revision 0 and the real PCI revision.
+@@ -983,6 +1012,9 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"_vm_sw_init", wrap_vm_sw_init, org_vm_sw_init},
+ 		{"_hdp_sw_init", wrap_hdp_sw_init, org_hdp_sw_init},
+ 		{"_athub_sw_init", wrap_athub_sw_init, org_athub_sw_init},
++		{"_mes_get_hw_version", wrap_mes_get_hw_version, org_mes_get_hw_version},
++		{"_mes_sw_init", wrap_mes_sw_init, org_mes_sw_init},
++		{"_ttlDevGetDoorbellRange", wrap_ttlDevGetDoorbellRange, org_ttlDevGetDoorbellRange},
+ 	};
+ 	for (auto &r : requests) {
+ 		if ((s2 || s3) && stage2Skips(r.symbol, s3))
+@@ -993,6 +1025,8 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 	}
+ 	LOG("gvm: selector hook %s, result hooks %d of 5", org_gvm_get_ip_function ? "installed" : "NOT installed",
+ 		!!org_gvm_sw_init + !!org_mc_sw_init + !!org_vm_sw_init + !!org_hdp_sw_init + !!org_athub_sw_init);
++	LOG("mes: version hook %s, result hooks %d of 2", org_mes_get_hw_version ? "installed" : "NOT installed",
++		!!org_mes_sw_init + !!org_ttlDevGetDoorbellRange);
+ 	org_vbs_post = patcher.solveSymbol(index, "_vbs_post");
+ 	gSkipTasks[0] = patcher.solveSymbol(index, "_PEM_Task_EnableDynamicStateManagement");
+ 	patcher.clearError();
+-- 
+2.43.0
+

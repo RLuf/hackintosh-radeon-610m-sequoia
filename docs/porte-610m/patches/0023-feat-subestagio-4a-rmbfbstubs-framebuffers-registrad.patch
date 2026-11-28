@@ -1,0 +1,208 @@
+From b11df7adca0e5d5f7cca53bb2ae148b417ef0663 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 20:00:54 -0800
+Subject: [PATCH 23/48] feat: subestagio 4a (-rmbfbstubs): framebuffers
+ registrados para habilitar o acelerador
+
+Medido no boot de 24/11 19:33 (kext patch 0022): o estagio 3 passou
+(ttl_initialize = 0, acelerador registrado, Metal lista 1 dispositivo), mas
+toda alocacao do Metal dorme em IOGraphicsAccelerator2::acceleratorWaitEnabled().
+
+Conferido por desmontagem do IOAcceleratorFamily2 (15.8.1): o bit habilitado
+([acc+0xc78] & 2) so e ligado por enableAccelerator(), chamada apenas por
+IOAccel(Legacy)DisplayMachine::display_mode_did_change(). Essa notificacao vem
+de IOFramebuffer::open(), que entrega WillChange, chama enableController e
+entrega DidChange mesmo quando enableController falha. Sem framebuffer
+(estagio 3: createFbStubs -> 0) o acelerador nunca habilita.
+
+Com rmbstage=3 e -rmbfbstubs:
+- os stubs de framebuffer da Apple sao publicados (sem as rotas headless);
+- os 6 ganchos que descartam escrita de registrador e tabela ATOM continuam;
+- AmdRadeonFramebuffer::enableController devolve kIOReturnUnsupported sem
+  rodar o codigo da Apple: o DAL nao roda, o DCN e o DMCUB ficam como a BIOS
+  deixou;
+- uma thread abre o framebuffer 0 depois que o acelerador casa e registra o
+  bit habilitado antes e depois, a contagem de framebuffers e o estado do
+  DMCUB (so leitura). -rmbnoopen: sem a abertura pelo kext.
+Sem -rmbfbstubs o comportamento e o do patch 0022.
+
+Confirma: "4a: after open: accel flags ... (enabled 1)" e o metal-teste
+"comando" conclui.
+Refuta: "enabled 0" com "vram desc null" (getVramInfo exige powerUp) ou sem
+DidChange.
+Para: panico, perda de SSH, linha ">> CtrlPowerUp" (o DAL rodou), RESTORE
+MISMATCH, "failed to route".
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSo88Xro5AsvDqwXSnr
+---
+ src/RembrandtGfx/display.cpp    | 74 +++++++++++++++++++++++++++++++++
+ src/RembrandtGfx/kern_start.cpp | 28 +++++++++++--
+ src/RembrandtGfx/rmb.hpp        |  2 +
+ 3 files changed, 100 insertions(+), 4 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 757453f..70e0f74 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3216,6 +3216,80 @@ bool displayRouteStage2(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 	return routed == arrsize(reqs);
+ }
+ 
++// Sub-stage 4a (rmbstage=3 plus -rmbfbstubs), patch 0023. Measured at the boot of 24/11 19:33: the
++// accelerator exists but every Metal allocation sleeps in IOGraphicsAccelerator2::
++// acceleratorWaitEnabled(). The enabled bit ([accel+0xc78] & 2, IOAcceleratorFamily2 of 15.8.1) is
++// set only by enableAccelerator(), whose only callers are IOAccel(Legacy)DisplayMachine::
++// display_mode_did_change(), and that notification comes from IOFramebuffer::open(): it delivers
++// WillChange, calls enableController and delivers DidChange even when enableController fails.
++// So: Apple's framebuffer stubs are published (kern_start.cpp), enableController is refused (the
++// DAL never runs, the DCN and the DMCUB stay as the BIOS left them, register writes still dropped)
++// and this thread opens framebuffer 0 once the accelerator is up. -rmbnoopen: no open by the kext.
++static void stage4aOpen(void *, wait_result_t) {
++	constexpr uint64_t Timeout = 120ULL * 1000 * 1000 * 1000;
++	constexpr uint32_t DcnSeg2 = 0x34C0;
++	auto accelFlags = [](IOService *accel) { return *reinterpret_cast<const volatile uint32_t *>(reinterpret_cast<const uint8_t *>(accel) + 0xc78); };
++	auto accelVram = [](IOService *accel) { return *reinterpret_cast<const volatile uint64_t *>(reinterpret_cast<const uint8_t *>(accel) + 0x180); };
++	auto matching = IOService::serviceMatching("AMDRadeonX6000_AMDNavi23GraphicsAccelerator");
++	auto accel = matching ? IOService::waitForMatchingService(matching, Timeout) : nullptr;
++	OSSafeReleaseNULL(matching);
++	if (!accel) {
++		LOG("4a: no accelerator within 120 s, framebuffer not opened");
++		return;
++	}
++	IOSleep(1000);
++	// Read-only picture of what the BIOS left running (the DMCUB that drives the panel).
++	if (mmioAvailable())
++		LOG("4a: before open: DMCUB_CNTL %x CNTL2 %x SCRATCH0 %x SCRATCH14 %x; accel flags %x (enabled %d) vram desc %s",
++		    mmioRead(DcnSeg2 + 0x1f6), mmioRead(DcnSeg2 + 0x200), mmioRead(DcnSeg2 + 0x1e3), mmioRead(DcnSeg2 + 0x1f1),
++		    accelFlags(accel), (accelFlags(accel) >> 1) & 1, accelVram(accel) ? "set" : "null");
++	IOService *fb0 = nullptr;
++	unsigned count = 0;
++	matching = IOService::serviceMatching("AMDRadeonX6000_AmdRadeonFramebuffer");
++	auto iter = matching ? IOService::getMatchingServices(matching) : nullptr;
++	OSSafeReleaseNULL(matching);
++	while (auto svc = iter ? OSDynamicCast(IOService, iter->getNextObject()) : nullptr) {
++		count++;
++		auto loc = svc->getLocation();
++		if (!fb0 && loc && !strcmp(loc, "0")) {
++			fb0 = svc;
++			fb0->retain();
++		}
++	}
++	OSSafeReleaseNULL(iter);
++	LOG("4a: %u AmdRadeonFramebuffer services, framebuffer 0 %s", count, fb0 ? "found" : "NOT found");
++	if (fb0 && !checkKernelArgument("-rmbnoopen")) {
++		auto vt = *reinterpret_cast<mach_vm_address_t **>(fb0);
++		size_t slot = 0;
++		for (size_t i = FbOpenSlotMin; gFbOpen && i <= FbOpenSlotMax && !slot; i++)
++			if (vt[i] == gFbOpen)
++				slot = i;
++		if (!slot) {
++			LOG("4a: framebuffer open %llx not in vtable slots %zu-%zu, not opening", gFbOpen, FbOpenSlotMin, FbOpenSlotMax);
++		} else {
++			LOG("4a: opening framebuffer 0 (vtable slot %zu)", slot);
++			auto r = reinterpret_cast<IOReturn (*)(IOService *)>(vt[slot])(fb0);
++			LOG("4a: framebuffer 0 open = %x (an error is expected: enableController is refused)", r);
++		}
++	}
++	IOSleep(500);
++	LOG("4a: after open: accel flags %x (enabled %d) vram desc %s; DMCUB_CNTL %x CNTL2 %x SCRATCH0 %x", accelFlags(accel),
++	    (accelFlags(accel) >> 1) & 1, accelVram(accel) ? "set" : "null", mmioAvailable() ? mmioRead(DcnSeg2 + 0x1f6) : 0,
++	    mmioAvailable() ? mmioRead(DcnSeg2 + 0x200) : 0, mmioAvailable() ? mmioRead(DcnSeg2 + 0x1e3) : 0);
++	OSSafeReleaseNULL(fb0);
++	accel->release();
++}
++
++void displayStage4aOpen(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
++	gFbOpen = patcher.solveSymbol(index, "__ZN35AMDRadeonX6000_AmdRadeonFramebuffer4openEv", address, size);
++	patcher.clearError();
++	if (!gFbOpen)
++		LOG("4a: AmdRadeonFramebuffer::open not found: the kext will not open framebuffer 0");
++	thread_t t;
++	if (kernel_thread_start(stage4aOpen, nullptr, &t) == KERN_SUCCESS)
++		thread_deallocate(t);
++}
++
+ void displayRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	gKeepPwrGate = checkKernelArgument("-rmbpwrgate");
+ 	gNoFwBl = checkKernelArgument("-rmbnofwbl");
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 42c6091..850b8a9 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -188,6 +188,13 @@ static uint64_t wrapCreateFbStubsZero(uint64_t ctrl, uint64_t count, uint64_t c,
+ }
+ // Stages 2 and 3: the headless route and all six write-dropping register hooks are in place.
+ static bool gFbStagedOk;
++// Sub-stage 4a: AmdRadeonFramebuffer::enableController fails without running Apple's code, so the
++// DAL (powerUp, mode set, DMCUB, PHY) never starts. IOFramebuffer::open still delivers the
++// display-mode notifications around it, which is all the accelerator needs.
++static uint64_t wrapFbEnableControllerRefused(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
++	LOG("4a: AmdRadeonFramebuffer::enableController refused (kIOReturnUnsupported), Apple's DAL not run");
++	return 0xe00002c7;
++}
+ // Stage 2 / 3 fallback, used only when the headless routes or write-blocking register hooks could not all be installed.
+ static uint64_t wrapCtrlStartDeclined(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+ 	LOG("stage %u: AmdRadeonController start declined (headless or register hooks missing)", rmbStage());
+@@ -493,7 +500,18 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 			ihMmioWptr(patcher, address, size);
+ 		s2WritesBlocked = displayRouteStage2(patcher, index, address, size);
+ 	}
+-	gHeadless = s2 || checkKernelArgument("-rmbheadless");
++	// Sub-stage 4a (patch 0023): stage 3 plus -rmbfbstubs keeps Apple's framebuffer stubs, so that
++	// the accelerator gets its display-mode notification and becomes enabled. Register writes stay
++	// dropped and enableController is refused: the DAL does not run. See display.cpp stage4aOpen.
++	bool fbStubs = s3 && checkKernelArgument("-rmbfbstubs");
++	gHeadless = (s2 && !fbStubs) || checkKernelArgument("-rmbheadless");
++	if (fbStubs && !gHeadless) {
++		gFbStagedOk = s2WritesBlocked;
++		LOG("4a: framebuffer stubs kept (-rmbfbstubs); 6 write-dropping register hooks %s; enableController will be refused",
++		    s2WritesBlocked ? "installed" : "MISSING: controller start will be declined");
++		if (s2WritesBlocked)
++			displayStage4aOpen(patcher, index, address, size);
++	}
+ 	if (gHeadless) {
+ 		KernelPatcher::RouteRequest fbReq {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer5startEP9IOService", wrapFbStart};
+ 		KernelPatcher::RouteRequest stubReq {"__ZN34AMDRadeonX6000_AmdRadeonController13createFbStubsEh", wrapCreateFbStubsZero, orgCreateFbStubs};
+@@ -514,7 +532,8 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 		{"__ZN34AMDRadeonX6000_AmdRadeonController5startEP9IOService", s2 && !gFbStagedOk ? wrapCtrlStartDeclined : wrap_CtrlStart, org_CtrlStart},
+ 		{"__ZN34AMDRadeonX6000_AmdRadeonController19initializeInternalsEP9IOService", wrap_CtrlInitInternals, org_CtrlInitInternals},
+ 		{"__ZN34AMDRadeonX6000_AmdRadeonController7powerUpEv", wrap_CtrlPowerUp, org_CtrlPowerUp},
+-		{"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer16enableControllerEv", wrap_FbEnableController, org_FbEnableController},
++		{"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer16enableControllerEv",
++		 fbStubs && !gHeadless ? wrapFbEnableControllerRefused : wrap_FbEnableController, org_FbEnableController},
+ 		{"__ZN40AMDRadeonX6000_AmdRadeonControllerNavi2328createControllerCoreServicesEv", wrap_CreateCoreServices, org_CreateCoreServices},
+ 		{"__ZN29AMDRadeonX6000_AmdGpuWrangler5startEP9IOService", wrap_WranglerStart, org_WranglerStart},
+ 		{"__ZN31AMDRadeonX6000_AmdAsicInfoNavi218populateDeviceInfoEv", wrapPopulateDeviceInfo, orgPopulateDeviceInfo},
+@@ -987,12 +1006,13 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0022, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s",
++	LOG("stage 3: kext patch 0023, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+ 	    checkKernelArgument("-rmbgpuclean") ? "by GPU DMA (-rmbgpuclean)" : "by CPU",
+-	    checkKernelArgument("-rmbutcl2harvest") ? "programmed (-rmbutcl2harvest)" : "not programmed");
++	    checkKernelArgument("-rmbutcl2harvest") ? "programmed (-rmbutcl2harvest)" : "not programmed",
++	    checkKernelArgument("-rmbfbstubs") ? "stubs kept, enableController refused (-rmbfbstubs, 4a)" : "none (headless)");
+ 	smuStage3BeforeHwInit();
+ 	s3Sample("before ttl_hw_init");
+ 	LOG(">> ttl_hw_init(%llx, %llx)", a, b);
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 65087af..822b281 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -124,6 +124,8 @@ void displaySetAgdcBase(mach_vm_address_t base);
+ void displayRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+ // Stage 2 variant: register hooks only, writes dropped; false if any of them could not be installed.
+ bool displayRouteStage2(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
++// Sub-stage 4a (rmbstage=3 plus -rmbfbstubs): opens framebuffer 0 once the accelerator is up.
++void displayStage4aOpen(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+ // AppleBacklight (AppleIntelPanelA under PNLF): panel table so it publishes "brightness".
+ void displayRouteBacklight(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+ bool mmioAvailable();
+-- 
+2.39.5 (Apple Git-154)
+

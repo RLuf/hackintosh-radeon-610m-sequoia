@@ -1,0 +1,198 @@
+From 7c4b93ef23ac37339dac3a73ab36c7e849ba0777 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 19:19:31 -0300
+Subject: [PATCH 40/48] -rmbsmuclkwatch: GFXCLK/FCLK a cada 2 s (para no
+ desligamento); -rmbgfxrange (experimento): SoftMax 1900 so com GFX_DPM ligado
+ (0x12 bit 19); trava do mailbox do SMU (0036)
+
+---
+ src/RembrandtGfx/firmware.cpp   |  2 +
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ src/RembrandtGfx/rmb.hpp        |  3 +-
+ src/RembrandtGfx/smu.cpp        | 98 +++++++++++++++++++++++++++++----
+ 4 files changed, 92 insertions(+), 13 deletions(-)
+
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index e0c76b3..09e702e 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -52,6 +52,8 @@ void pspTeardownSeq(uint64_t p, const char *tag) {
+ IOReturn powerHandler(void *, void *, UInt32 type, IOService *, void *arg, vm_size_t) {
+ 	// Stage 3: headless and no sleep support. Only the shutdown / restart steps below run, without
+ 	// the panel power-off; sleep and wake messages are ignored (disable sleep for the test).
++	if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart || type == kIOMessageSystemWillSleep)
++		smuWatchStop();  // patch 0036: no SMU queries from the watch thread past this point
+ 	bool s3 = rmbStage() == 3;
+ 	if (s3 && type != kIOMessageSystemWillPowerOff && type != kIOMessageSystemWillRestart) {
+ 		static bool logged;
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index d258701..8e542eb 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0035, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0036, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index b2f2214..801dbaf 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -190,7 +190,8 @@ uint64_t ptVmidBase(uint32_t vmid);
+ void shaderDump(const char *why);  // patch 0033: shader code at a hang, HDP flush remap
+ void waveDump(const char *why);
+ void smuClockLog(const char *why);  // patch 0035 (-rmbsmuclk): GFXCLK/FCLK from the PMFW
+-void smuClockInit();  // patch 0034: live wave state (PC, STATUS, counters) at a hang
++void smuClockInit();
++void smuWatchStop();  // patch 0036: stop the -rmbsmuclkwatch thread (power handler)  // patch 0034: live wave state (PC, STATUS, counters) at a hang
+ extern bool gWaveDump;  // -rmbwavedump
+ void mmhubDump(const char *why);  // 0 when the context is disabled
+ void gartCensus(const char *when);
+diff --git a/src/RembrandtGfx/smu.cpp b/src/RembrandtGfx/smu.cpp
+index 193e4db..9deb600 100644
+--- a/src/RembrandtGfx/smu.cpp
++++ b/src/RembrandtGfx/smu.cpp
+@@ -23,8 +23,18 @@ enum : uint32_t {
+ 	// amdgpu_smu.c:689-692). They return the current clock in MHz in the argument; they change nothing.
+ 	PPSMC_MSG_GetGfxclkFrequency = 0x17,
+ 	PPSMC_MSG_GetFclkFrequency = 0x18,
++	// Patch 0036 (-rmbgfxrange, EXPERIMENT, not what Linux does at boot): Linux only sends the GFX range
++	// (SetHardMinGfxClk/SetSoftMaxGfxClk, yellow_carp_ppt.c:947-990) when the DPM level changes, and only
++	// if GetEnabledSmuFeatures (0x12, arg 0 = low 32 bits) has FEATURE_GFX_DPM_BIT 19 (smu_cmn.c:690-701,
++	// smu_v13_0_1_pmfw.h:54). Here: read the mask, and only with bit 19 send SetSoftMaxGfxClk(1900 MHz,
++	// the 610M published max) to lift a possibly low default cap. No hard min. Argument in MHz.
++	PPSMC_MSG_GetEnabledSmuFeatures = 0x12,
++	PPSMC_MSG_SetSoftMaxGfxClk = 0x1B,
++	PPSMC_MSG_SetHardMinGfxClk = 0x1C,
+ };
+-bool gSmuClk;
++bool gSmuClk, gSmuClkWatch, gGfxRange;
++volatile bool gSmuWatchStop;  // patch 0036: set by the power handler before shutdown/restart/sleep
++IOLock *gSmuLock;  // patch 0036: the watch thread and the hang path share the MP1 mailbox
+ 
+ bool waitResp(uint32_t &resp, int ms = 1000) {
+ 	for (int i = 0; i < ms * 100; i++) {
+@@ -45,24 +55,59 @@ uint32_t sendMsg(uint32_t msg, uint32_t &arg, int ms = 1000) {
+ 	bool armed = stage == 3 && rmbStage3Armed();
+ 	bool allowed = msg == PPSMC_MSG_GetSmuVersion || (armed && msg == PPSMC_MSG_DisallowGfxOff) ||
+ 	               (armed && gSmuClk && (msg == PPSMC_MSG_GetGfxclkFrequency || msg == PPSMC_MSG_GetFclkFrequency)) ||
++	               (armed && gGfxRange && (msg == PPSMC_MSG_GetEnabledSmuFeatures || msg == PPSMC_MSG_SetSoftMaxGfxClk)) ||
+ 	               (armed && msg == PPSMC_MSG_GfxDeviceDriverReset && checkKernelArgument("-rmbmode2"));
+ 	if ((stage == 2 || stage == 3) && !allowed) {
+ 		LOG("smu: stage %u, msg %#x not sent", stage, msg);
+ 		return 0;
+ 	}
++	if (gSmuLock)
++		IOLockLock(gSmuLock);
++	uint32_t ret = 0;
+ 	if (!waitResp(resp, ms)) {
+ 		LOG("smu: mailbox busy before msg %#x", msg);
+-		return 0;
++	} else {
++		mmioWrite(RegResp, 0);
++		mmioWrite(RegArg, arg);
++		mmioWrite(RegMsg, msg);
++		if (!waitResp(resp, ms)) {
++			LOG("smu: msg %#x timed out after %d ms", msg, ms);
++		} else {
++			arg = mmioRead(RegArg);
++			ret = resp;
++		}
+ 	}
+-	mmioWrite(RegResp, 0);
+-	mmioWrite(RegArg, arg);
+-	mmioWrite(RegMsg, msg);
+-	if (!waitResp(resp, ms)) {
+-		LOG("smu: msg %#x timed out after %d ms", msg, ms);
+-		return 0;
++	if (gSmuLock)
++		IOLockUnlock(gSmuLock);
++	return ret;
++}
++
++// Patch 0036 (-rmbsmuclkwatch): GFXCLK/FCLK every 2 s for the whole boot; a line only when a value
++// changes, plus a min/max summary every 60 s. Read-only queries (0x17/0x18), same as patch 0035.
++void smuClockWatch(void *, wait_result_t) {
++	uint32_t lastG = ~0u, lastF = ~0u, minG = ~0u, maxG = 0, minF = ~0u, maxF = 0;
++	for (uint32_t tick = 1;; tick++) {
++		IOSleep(2000);
++		if (gSmuWatchStop) {
++			LOG("smuclk watch: stopped (power event)");
++			return;
++		}
++		uint32_t g = 0, f = 0;
++		uint32_t rg = sendMsg(PPSMC_MSG_GetGfxclkFrequency, g, 100), rf = sendMsg(PPSMC_MSG_GetFclkFrequency, f, 100);
++		if (rg != 1 || rf != 1) {
++			LOG("smuclk watch: resp %u/%u, stopping", rg, rf);
++			return;
++		}
++		if (g != lastG || f != lastF)
++			LOG("smuclk watch t+%us: GFXCLK %u MHz, FCLK %u MHz", tick * 2, g, f);
++		lastG = g, lastF = f;
++		if (g < minG) minG = g;
++		if (g > maxG) maxG = g;
++		if (f < minF) minF = f;
++		if (f > maxF) maxF = f;
++		if (tick % 30 == 0)
++			LOG("smuclk watch t+%us summary: GFXCLK %u..%u MHz, FCLK %u..%u MHz", tick * 2, minG, maxG, minF, maxF);
+ 	}
+-	arg = mmioRead(RegArg);
+-	return resp;
+ }
+ 
+ uint8_t gContext[0x100];  // opaque handle handed back to TTL
+@@ -138,6 +183,28 @@ uint64_t smuHwInit(uint64_t handle, uint64_t in, uint64_t out, uint64_t, uint64_
+ 	LOG("smu_hw_init: DisallowGfxOff resp %u", sendMsg(PPSMC_MSG_DisallowGfxOff, arg));
+ 	if (gSmuClk)
+ 		smuClockLog("smu_hw_init");
++	static bool smu0036Started;
++	if (gGfxRange && !smu0036Started) {  // patch 0036 experiment (see the enum comment)
++		uint32_t feat = 0;
++		uint32_t rf = sendMsg(PPSMC_MSG_GetEnabledSmuFeatures, feat);
++		bool gfxDpm = rf == 1 && (feat & (1u << 19));
++		LOG("gfxrange smu_hw_init: GetEnabledSmuFeatures resp %u mask %08x, GFX_DPM (bit 19) %s", rf, feat, gfxDpm ? "on" : "off");
++		if (gfxDpm) {
++			uint32_t mx = 1900;
++			LOG("gfxrange smu_hw_init: SetSoftMaxGfxClk 1900 resp %u (arg back %u)", sendMsg(PPSMC_MSG_SetSoftMaxGfxClk, mx), mx);
++			if (gSmuClk)
++				smuClockLog("after gfxrange");
++		} else {
++			LOG("gfxrange smu_hw_init: GFX DPM off or unknown, nothing sent");
++		}
++	}
++	if (gSmuClkWatch && !smu0036Started) {
++		thread_t t;
++		if (kernel_thread_start(smuClockWatch, nullptr, &t) == KERN_SUCCESS)
++			thread_deallocate(t);
++		LOG("smuclk watch: started (every 2 s)");
++	}
++	smu0036Started = true;
+ 	applyGcGolden();
+ 	startGoldenGuard();
+ 	if (rmbStage() == 3)  // headless: the DMCUB the firmware started keeps running, nobody touches it
+@@ -172,8 +239,17 @@ void smuClockLog(const char *why) {
+ 	LOG("smuclk %s: GFXCLK %u MHz (resp %u), FCLK %u MHz (resp %u)", why, g, rg, f, rf);
+ }
+ 
++void smuWatchStop() { gSmuWatchStop = true; }  // patch 0036, called by powerHandler
++
+ void smuClockInit() {
+-	gSmuClk = checkKernelArgument("-rmbsmuclk");
++	gSmuClkWatch = checkKernelArgument("-rmbsmuclkwatch");  // patch 0036
++	gGfxRange = checkKernelArgument("-rmbgfxrange");        // patch 0036
++	gSmuClk = checkKernelArgument("-rmbsmuclk") || gSmuClkWatch;
++	if ((gSmuClk || gGfxRange) && !gSmuLock) {
++		gSmuLock = IOLockAlloc();
++		if (!gSmuLock)
++			LOG("smu: IOLockAlloc failed, mailbox runs without a lock");
++	}
+ }
+ 
+ // Stop the command processors and SDMA the way Linux gfx/sdma hw_fini do (cp_enable/sdma_enable
+-- 
+2.39.5 (Apple Git-154)
+

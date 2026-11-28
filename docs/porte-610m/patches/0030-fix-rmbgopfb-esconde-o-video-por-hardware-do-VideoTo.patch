@@ -1,0 +1,77 @@
+From 648fd3790eb4dd11115eb828e43e31144d0699c5 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 00:35:00 -0300
+Subject: [PATCH 30/48] fix: -rmbgopfb esconde o video por hardware do
+ VideoToolbox (0028c)
+
+Boot de 26/11 00:19 (0028b): papel de parede no painel e login aceito, mas
+aos 248,97 s o HWLibs esperou 1 s por _engine_vcn_fw_loaded
+(_engine_initialize) enquanto o VTDecoderXPCService decodificava video;
+depois os canais VMPT/SDMA0 nunca mais concluiram (ultimo pacote
+POLL_REGMEM), o WindowServer ficou preso no reinicio do canal e o watchdogd
+deu panico. E o travamento descrito no noVideoEngine do upstream, que so
+rodava no caminho normal do kext.
+
+Com -rmbgopfb o noVideoEngine agora roda tambem (-rmbvcn mantem o video por
+hardware), e a protecao vale o boot inteiro: a cada 1 s por 3 min e depois a
+cada 5 s (antes parava em 3 min; o travamento veio aos 4 min 08 s).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/display.cpp    | 18 +++++++++++++++---
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ 2 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 4025fc3..e596745 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -2665,9 +2665,11 @@ void noVideoEngine(void *, wait_result_t) {
+ 		return;
+ 	}
+ 	LOG("novcn: hid %u hardware video properties (VideoToolbox uses software codecs)", stripVideoProps(accel));
+-	// The driver may publish more at runtime (engine powerUp); keep them off for 3 min.
+-	for (int i = 0; i < 180; i++) {
+-		IOSleep(1000);
++	// The driver may publish more at runtime (engine powerUp); keep them off for the whole boot
++	// (patch 0028c: the hang of 26/11 00:23 came at 4 min 08 s, after the old 3 min window):
++	// every second for 3 min, then every 5 s.
++	for (int i = 0;; i++) {
++		IOSleep(i < 180 ? 1000 : 5000);
+ 		if (auto n = stripVideoProps(accel))
+ 			LOG("novcn: hid %u more video properties at +%d s", n, i + 1);
+ 	}
+@@ -3863,6 +3865,16 @@ void displayRouteGopFb(KernelPatcher &patcher, size_t index, mach_vm_address_t a
+ 		patcher.clearError();
+ 	}
+ 	gRouted = routed == arrsize(reqs) && gIrqLock;
++	// Patch 0028c: boot of 26/11 00:19 hung at 248.97 s in _engine_initialize -> _engine_vcn_fw_loaded
++	// (1 s timeout) while VTDecoderXPCService decoded video, then VMPT/SDMA0 never completed
++	// (POLL_REGMEM) and watchdogd panicked. The upstream guard (noVideoEngine, VideoToolbox in
++	// software) only ran on the full display path; run it here too (`-rmbvcn` keeps hardware video).
++	if (!checkKernelArgument("-rmbvcn")) {
++		thread_t vt;
++		if (kernel_thread_start(noVideoEngine, nullptr, &vt) == KERN_SUCCESS)
++			thread_deallocate(vt);
++		LOG("gopfb: hardware video hidden from VideoToolbox (noVideoEngine started)");
++	}
+ 	LOG("gopfb: %zu of %zu framebuffer virtuals routed; enableController will %s", routed, arrsize(reqs),
+ 	    gRouted ? "return success once the inherited mode is read" : "keep refusing (not every route is in place)");
+ 	thread_t t;
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 7079780..fc4a3d9 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0028b, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0028c, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+-- 
+2.39.5 (Apple Git-154)
+

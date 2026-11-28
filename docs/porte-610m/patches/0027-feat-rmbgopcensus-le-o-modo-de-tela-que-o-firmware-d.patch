@@ -1,0 +1,238 @@
+From a4c3a90da49d9535b30c77d64aa3d40e4d58caed Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Wed, 25 Nov 2026 22:10:19 -0300
+Subject: [PATCH 27/48] feat: -rmbgopcensus le o modo de tela que o firmware
+ deixou aceso (so leitura)
+
+Medido em 25/11 (Brasilia) com o patch 0026: a aceleracao Metal da 610M sobe
+sozinha no boot (comando em 1,8 ms, anel de interrupcoes vivo), mas nao ha tela:
+as escritas do kext do framebuffer seguem descartadas, o enableController e
+recusado e o WindowServer aborta em CoreDisplay porque IOFramebuffer::open
+falha.
+
+Rota escolhida para a tela (plano em rev/plano-tela/PLANO.md): em vez de rodar
+o DAL da Apple corrigido para o DCN 3.1.6, os stubs AmdRadeonFramebuffer que ja
+existem herdam o modo que o GOP deixou no eDP e so reapontam o plano 0 (HUBP0)
+para a superficie do macOS, como o projeto Radeonized faz na 680M com um
+framebuffer proprio. Depende de poucos registradores, todos com o mesmo offset
+no DCN 3.1.2 e no 3.1.6 (Linux v6.12: 6402 registradores em comum, nenhum
+offset difere; os 35 lidos aqui foram conferidos um a um no
+dcn_3_1_6_offset.h).
+
+Este patch so mede a entrada dessa rota. Com -rmbgopcensus (sem ele nada muda):
+OTG0-3 (controle, totais, blanking, posicao, contador de quadros), HUBP0-3
+(formato, tiling, viewport, pitch, endereco primario, flip, DET), o endereco em
+uso no HUBP0, DPP/CNVC/DIG/DP do pipe 0, PWM do brilho, DMCUB, quadros por
+segundo pelo contador do OTG0, o console que o firmware passou ao kernel
+(endereco fisico, bytes por linha, largura, altura, profundidade) e as
+propriedades do stub fb0. Tres leituras na subida (antes do open, depois, e 30 s
+depois) e outra a cada vez que a variavel de NVRAM rmb-census aparece.
+Nenhuma escrita: mmioRead, getConsoleInfo e getProperty.
+
+Confirma a rota: OTG0 ligado com 1366x768, HUBP0 com superficie linear ARGB8888
+dentro do FB, contador de quadros andando (~60 por segundo).
+Refuta: OTG0 desligado, superficie em tiling ou fora da faixa do FB.
+Para: panico ou perda de SSH (o patch nao escreve nada).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/display.cpp    | 93 +++++++++++++++++++++++++++++++++
+ src/RembrandtGfx/kern_start.cpp | 24 +++++++--
+ src/RembrandtGfx/rmb.hpp        |  2 +
+ 3 files changed, 116 insertions(+), 3 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index eec6f0f..1e10b38 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -4,6 +4,8 @@
+ //  (dcnremap.hpp, generated from the Linux headers by scripts/dcn-remap.py).
+ //
+ 
++#include <IOKit/IOPlatformExpert.h>
++#include <pexpert/pexpert.h>
+ #include "rmb.hpp"
+ #include "dcnremap.hpp"
+ #include "phyvalid.hpp"
+@@ -3239,6 +3241,91 @@ bool displayRouteStage2(KernelPatcher &patcher, size_t index, mach_vm_address_t
+ 	return routed == arrsize(reqs);
+ }
+ 
++// Patch 0027 (-rmbgopcensus, opt-in, READ-ONLY): what the firmware left lit on the DCN 3.1.6, the
++// input for a framebuffer that inherits the GOP mode instead of running Apple's DAL. Every offset
++// is a DCN segment-2 dword (DMU base 0x34C0, ipdisc hw_id 271) and is identical in Linux v6.12
++// dcn_3_1_2_offset.h and dcn_3_1_6_offset.h (6402 common registers, no offset differs). Nothing is
++// written: mmioRead only, plus IORegistry property reads on the framebuffer stub.
++// -rmbgopcensus absent: this function returns at once.
++static void gopCensus(IOService *fb0, const char *when) {
++	if (!checkKernelArgument("-rmbgopcensus") || !mmioAvailable())
++		return;
++	constexpr uint32_t D = 0x34C0;
++	constexpr uint32_t HubpStride = 0xdc, OtgStride = 0x80;
++	for (uint32_t i = 0; i < 4; i++) {
++		uint32_t h = D + i * HubpStride, o = D + i * OtgStride;
++		// OTGn: CONTROL 0x1b41, H_TOTAL 0x1b2a, H_BLANK 0x1b2b, V_TOTAL 0x1b2f, V_BLANK 0x1b36,
++		// STATUS_POSITION 0x1b4a, STATUS_FRAME_COUNT 0x1b4c; ODMn OPTC_DATA_SOURCE_SELECT 0x1acb (+0x10/inst).
++		LOG("gop %s: OTG%u CONTROL %x H_TOTAL %x H_BLANK %x V_TOTAL %x V_BLANK %x POS %x FRAMES %x ODM_SRC %x", when, i,
++		    mmioRead(o + 0x1b41), mmioRead(o + 0x1b2a), mmioRead(o + 0x1b2b), mmioRead(o + 0x1b2f), mmioRead(o + 0x1b36),
++		    mmioRead(o + 0x1b4a), mmioRead(o + 0x1b4c), mmioRead(D + 0x1acb + i * 0x10));
++		// HUBPn: SURFACE_CONFIG 0x5e5, ADDR_CONFIG 0x5e6, TILING 0x5e7, PRI_VIEWPORT_DIMENSION 0x5ea,
++		// CLK_CNTL 0x5f4, PITCH 0x607, PRIMARY_ADDR 0x60a / HIGH 0x60b, FLIP_CONTROL 0x61b.
++		LOG("gop %s: HUBP%u CFG %x ADDR_CFG %x TILING %x VIEWPORT %x CLK %x PITCH %x ADDR %x_%08x FLIP %x DET %x", when, i,
++		    mmioRead(h + 0x5e5), mmioRead(h + 0x5e6), mmioRead(h + 0x5e7), mmioRead(h + 0x5ea), mmioRead(h + 0x5f4),
++		    mmioRead(h + 0x607), mmioRead(h + 0x60b), mmioRead(h + 0x60a), mmioRead(h + 0x61b), mmioRead(D + 0x4cc + i));
++	}
++	// HUBP0 again, what a GOP-inheriting framebuffer will touch or must preserve: PRI_VIEWPORT_START
++	// 0x5e9, PITCH_C 0x608, SECONDARY_ADDR 0x60e, SURFACE_CONTROL 0x61a, SURFACE_INUSE 0x621 / HIGH
++	// 0x622 (the address being scanned out now), HUBPRET_CONTROL 0x66c; OTG0 MASTER_EN 0x1b5c.
++	LOG("gop %s: HUBP0 VP_START %x PITCH_C %x SEC_ADDR %x SURF_CTL %x INUSE %x_%08x HUBPRET %x; OTG0 MASTER_EN %x", when,
++	    mmioRead(D + 0x5e9), mmioRead(D + 0x608), mmioRead(D + 0x60e), mmioRead(D + 0x61a), mmioRead(D + 0x622),
++	    mmioRead(D + 0x621), mmioRead(D + 0x66c), mmioRead(D + 0x1b5c));
++	// The console the firmware handed to the kernel (GOP framebuffer): CPU physical address and geometry.
++	PE_Video v {};
++	if (auto pe = IOService::getPlatform(); pe && pe->getConsoleInfo(&v) == kIOReturnSuccess)
++		LOG("gop %s: firmware console base %lx rowBytes %lu %lux%lu depth %lu display %lu", when, v.v_baseAddr, v.v_rowBytes,
++		    v.v_width, v.v_height, v.v_depth, v.v_display);
++	else
++		LOG("gop %s: firmware console info not available", when);
++	// DCHUBBUB_COMPBUF_CTRL 0x4cb, DPP0 DPP_CONTROL 0xcc5, CNVC0 FORMAT_CONTROL 0xcd0, DIG0 FE 0x208b /
++	// BE 0x20b0, DP0 LINK_CNTL 0x2108 / CONFIG 0x210b, PWRSEQ0 BL_PWM_CNTL 0x2f19 / PERIOD 0x2f1b,
++	// DMCUB CNTL 0x1f6 / CNTL2 0x200 / SCRATCH0 0x1e3 / SCRATCH14 0x1f1 (boot options).
++	LOG("gop %s: COMPBUF %x DPP0 %x CNVC0 %x DIG0 FE %x BE %x DP0 LINK %x CFG %x BL_PWM %x PERIOD %x DMCUB %x/%x S0 %x S14 %x",
++	    when, mmioRead(D + 0x4cb), mmioRead(D + 0xcc5), mmioRead(D + 0xcd0), mmioRead(D + 0x208b), mmioRead(D + 0x20b0),
++	    mmioRead(D + 0x2108), mmioRead(D + 0x210b), mmioRead(D + 0x2f19), mmioRead(D + 0x2f1b), mmioRead(D + 0x1f6),
++	    mmioRead(D + 0x200), mmioRead(D + 0x1e3), mmioRead(D + 0x1f1));
++	// Refresh rate without the pixel clock: OTG0 frame counter over 1 s (only if OTG0 is enabled).
++	if (mmioRead(D + 0x1b41) & 1) {
++		uint32_t f0 = mmioRead(D + 0x1b4c);
++		IOSleep(1000);
++		uint32_t f1 = mmioRead(D + 0x1b4c);
++		LOG("gop %s: OTG0 frame counter %x -> %x in 1000 ms (%u frames)", when, f0, f1, f1 - f0);
++	}
++	// What the accelerator's AMDHWDisplay::getDisplayInfo will read from this stub (Radeonized's
++	// journal, 15.x X6000: 'ATY,fb_offset' and friends), and what IOFramebuffer published.
++	static const char *const keys[] {"ATY,fb_offset", "ATY,fb_linebytes", "ATY,fb_size", "IOFBCurrentPixelCount",
++	                                  "IOFBMemorySize", "AAPL,boot-display", "connector-type", "display-connect-flags"};
++	for (auto k : keys) {
++		auto p = fb0 ? fb0->getProperty(k) : nullptr;
++		if (auto d = OSDynamicCast(OSData, p))
++			LOG("gop %s: fb0 %s = data[%u] %08x", when, k, d->getLength(),
++			    d->getLength() >= 4 ? *static_cast<const uint32_t *>(d->getBytesNoCopy()) : 0);
++		else if (auto n = OSDynamicCast(OSNumber, p))
++			LOG("gop %s: fb0 %s = %llu", when, k, n->unsigned64BitValue());
++		else
++			LOG("gop %s: fb0 %s %s", when, k, p ? "(other type)" : "absent");
++	}
++}
++
++// The same census on request (NVRAM trigger rmb-census, kern_start.cpp), any time after boot.
++void displayGopCensus(const char *when) {
++	IOService *fb0 = nullptr;
++	auto matching = IOService::serviceMatching("AMDRadeonX6000_AmdRadeonFramebuffer");
++	auto iter = matching ? IOService::getMatchingServices(matching) : nullptr;
++	OSSafeReleaseNULL(matching);
++	while (auto svc = iter ? OSDynamicCast(IOService, iter->getNextObject()) : nullptr) {
++		auto loc = svc->getLocation();
++		if (!fb0 && loc && !strcmp(loc, "0")) {
++			fb0 = svc;
++			fb0->retain();
++		}
++	}
++	OSSafeReleaseNULL(iter);
++	gopCensus(fb0, when);
++	OSSafeReleaseNULL(fb0);
++}
++
+ // Sub-stage 4a (rmbstage=3 plus -rmbfbstubs), patch 0023. Measured at the boot of 24/11 19:33: the
+ // accelerator exists but every Metal allocation sleeps in IOGraphicsAccelerator2::
+ // acceleratorWaitEnabled(). The enabled bit ([accel+0xc78] & 2, IOAcceleratorFamily2 of 15.8.1) is
+@@ -3281,6 +3368,7 @@ static void stage4aOpen(void *, wait_result_t) {
+ 	}
+ 	OSSafeReleaseNULL(iter);
+ 	LOG("4a: %u AmdRadeonFramebuffer services, framebuffer 0 %s", count, fb0 ? "found" : "NOT found");
++	gopCensus(fb0, "before open");
+ 	if (fb0 && !checkKernelArgument("-rmbnoopen")) {
+ 		auto vt = *reinterpret_cast<mach_vm_address_t **>(fb0);
+ 		size_t slot = 0;
+@@ -3299,6 +3387,11 @@ static void stage4aOpen(void *, wait_result_t) {
+ 	LOG("4a: after open: accel flags %x (enabled %d) vram desc %s; DMCUB_CNTL %x CNTL2 %x SCRATCH0 %x", accelFlags(accel),
+ 	    (accelFlags(accel) >> 1) & 1, accelVram(accel) ? "set" : "null", mmioAvailable() ? mmioRead(DcnSeg2 + 0x1f6) : 0,
+ 	    mmioAvailable() ? mmioRead(DcnSeg2 + 0x200) : 0, mmioAvailable() ? mmioRead(DcnSeg2 + 0x1e3) : 0);
++	gopCensus(fb0, "after open");
++	if (checkKernelArgument("-rmbgopcensus")) {
++		IOSleep(30000);
++		gopCensus(fb0, "30 s after open");  // WindowServer has tried (and failed) by now
++	}
+ 	OSSafeReleaseNULL(fb0);
+ 	accel->release();
+ }
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 1b011bd..8d7bed1 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -404,6 +404,10 @@ static void msg1bThread(void *, wait_result_t) {
+ 	}
+ 	opts->release();
+ 	bool ignIrq = value("rmb-irq") >= 0, ignMsg = value("rmb-msg1b") >= 0;
++	// Patch 0027: rmb-census repeats the read-only display census each time the variable appears
++	// (delete it and set it again for another one). Needs -rmbgopcensus; present at boot = ignored.
++	bool censusOn = checkKernelArgument("-rmbgopcensus"), censusSeen = value("rmb-census") >= 0, censusIgn = censusSeen;
++	uint32_t censusCount = 0;
+ 	if (ignIrq)
+ 		LOG("4a: triggers: NVRAM variable rmb-irq already present at boot: ignored for this whole boot (sudo nvram -d rmb-irq)");
+ 	if (ignMsg)
+@@ -414,12 +418,26 @@ static void msg1bThread(void *, wait_result_t) {
+ 	// The watchdog runs for as long as the ring is alive; the triggers are read for 4 hours.
+ 	for (uint32_t tick = 0;; tick++) {
+ 		bool triggersOpen = tick < 4 * 3600 * 10 && !((ignIrq || gIrqDone) && (ignMsg || gMsg1bDone));
+-		if (!gIrqLive && !triggersOpen)
++		bool censusOpen = censusOn && tick < 4 * 3600 * 10;
++		if (!gIrqLive && !triggersOpen && !censusOpen)
+ 			break;
+ 		IOSleep(100);
+ 		if (gIrqLive && irqWatch())
+ 			gIrqLive = false;
+-		if (tick % 10 || !triggersOpen)
++		if (tick % 10)
++			continue;
++		if (censusOpen) {
++			bool now = value("rmb-census") >= 0;
++			if (!now)
++				censusIgn = false;  // deleted: the next appearance counts
++			else if (!censusSeen && !censusIgn) {
++				char when[24];
++				snprintf(when, sizeof(when), "on request %u", ++censusCount);
++				displayGopCensus(when);
++			}
++			censusSeen = now;
++		}
++		if (!triggersOpen)
+ 			continue;
+ 		uint64_t ctrl = gCtrl4a;
+ 		if (!ignIrq && !gIrqDone) {
+@@ -1261,7 +1279,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0026, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0027, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index f4dd1e1..b1e3037 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -131,6 +131,8 @@ void displayRouteBacklight(KernelPatcher &patcher, size_t index, mach_vm_address
+ bool mmioAvailable();
+ // Disable + drain the IH rings left running by a previous VM run (INTx stuck asserted otherwise).
+ void quiesceIh(const char *why);
++// Patch 0027 (-rmbgopcensus): read-only census of the display mode the firmware left lit.
++void displayGopCensus(const char *when);
+ // Patch 0026: stops the interrupt ring and the MSI source if the kext started them (power handler).
+ void irqStopForShutdown(const char *why);
+ // Patch 0025: turns the interrupt rings off, whatever the stage (rmb-irq watchdog only).
+-- 
+2.39.5 (Apple Git-154)
+

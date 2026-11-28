@@ -1,0 +1,356 @@
+From 7033082739d6fd38730cf40b3f5eb405c67c6c16 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Wed, 25 Nov 2026 14:56:44 -0800
+Subject: [PATCH 25/48] feat: interrupcoes do acelerador por disparo de NVRAM
+ (startInterrupts e mensagem 0x1b)
+
+Medido no boot de 25/11 15:14 (kext patch 0024): a 610M executa comandos Metal
+(metal-teste: buffer de 4096 bytes preenchido pela GPU, status 4, sem erro;
+SDMA0_PAGE 15/14, SDMA0 1/1, GFX concluindo), mas a conclusao so e notada pelo
+vigia de progresso do IOAccel, a cada ~5 s ("checkGPUProgress - Signaling
+hardware error on channel N", reinicio pulado): o comando levou 16,2 s.
+
+Conferido por desmontagem (15.8.1): o tratador de MSI e a biblioteca de IRQ so
+sao ligados por AmdInterruptManager::startInterrupts (bfe49c0), chamado apenas
+por AmdRadeonController::powerUp (c01952f: wl = [ctrl+0xc0]->vt 0x688(), que e
+IOFramebuffer::getWorkLoop do framebuffer 0; c01977f: [ctrl+0x7978]->vt
+0x120(wl); c01979a: [ctrl+0x5f18] |= 1), que o 4a nao roda. As escritas de
+registrador dessa biblioteca passam por AmdRegisterAccess::writeReg32
+(wrapRawWrite), que os estagios 2 e 3 descartam.
+
+Este patch nao muda a subida. Uma thread atende duas variaveis de NVRAM, uma
+vez por boot cada, ignoradas o boot inteiro se ja existirem na subida:
+- rmb-irq=1 (qualquer valor que nao comece por 'd'): chama startInterrupts como
+  a Apple; a partir dai as escritas para o OSSSYS (anel de interrupcoes,
+  0x10A0-0x125F) e para GC/SDMA0 (0x1260-0x34BF, 0xA000-0xFFFF) passam, todo o
+  resto (NBIO, HDP, motor de video) continua descartado; cada escrita e
+  registrada ("irq: pass|drop raw write");
+- rmb-irq=d: a mesma chamada com tudo descartado, so para listar as escritas;
+- rmb-msg1b=1: mensagem 0x1b (AMDHardware::enableInterrupts); recusada enquanto
+  o rmb-irq=1 nao tiver rodado com sucesso (-rmbmsg1bfree libera).
+Um vigia (100 ms), ligado sempre que as escritas podem passar, mesmo se
+startInterrupts falhar, desliga o anel (RB_ENABLE/ENABLE_INTR, como
+navi10_ih_disable_interrupts) e a fonte MSI se houver tempestade (mais de 2000
+leituras de wptr ou 20000 entradas em 100 ms) ou transbordo (bit 0 do
+IH_RB_WPTR). Estado do anel, do MSI e das entradas por cliente antes e depois
+("irq before|after|alive|stopped").
+
+Confirma: "irq: startInterrupts = 0", "irq after: IH ring0 cntl" com RB_ENABLE,
+MSI habilitado, "msg1b after: ... hw+319 1" e o metal-teste "comando" conclui
+em menos de 1 s, sem "Signaling hardware error".
+Refuta: startInterrupts diferente de 0; anel sem RB_ENABLE; comando ainda lento.
+Para: panico, perda de SSH, "irq: WATCHDOG", GPU Restart, maquina em repouso
+com o anel ligado.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/display.cpp    |  23 ++++
+ src/RembrandtGfx/kern_start.cpp | 183 ++++++++++++++++++++++++++------
+ src/RembrandtGfx/mmio.cpp       |  16 +++
+ src/RembrandtGfx/rmb.hpp        |   6 ++
+ 4 files changed, 193 insertions(+), 35 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 70e0f74..eec6f0f 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -1746,8 +1746,31 @@ uint64_t wrapRawRead(uint64_t self, uint64_t reg) {
+ 	return v;
+ }
+ 
++// Patch 0025. Apple's interrupt library (AmdInterruptManager::startInterrupts and what the
++// accelerator asks of it afterwards) writes its registers through AmdRegisterAccess::writeReg32,
++// i.e. through this hook, which stages 2 and 3 turn into a drop. Once the rmb-irq thread sets the
++// mode, the interrupt ring (OSSSYS 5.2.1, base 0x10A0) and GC / SDMA0 (source enables) go to the
++// chip untouched; everything else (NBIO, HDP, the whole display engine) is still dropped. Every
++// write is logged, passed or not, so the next step knows exactly what the library wanted.
++// (the three counters are defined in kern_start.cpp: this file is one anonymous namespace)
++static bool irqPassReg(uint32_t r) {
++	return (r >= 0x10A0 && r < 0x1260)     // OSSSYS 5.2.1 (IH), discovery hw_id 40
++	    || (r >= 0x1260 && r < 0x34C0)     // GC 10.3.7 / SDMA0 5.2.7, segment 0
++	    || (r >= 0xA000 && r < 0x10000);   // GC / SDMA0, segment 1
++}
++
+ uint64_t wrapRawWrite(uint64_t self, uint64_t reg, uint64_t val) {
+ 	uint32_t r = reg & 0xFFFFFFFF;
++	if (uint32_t mode = gIrqWriteMode; mode && rmbStage() == 3) {
++		bool pass = mode == 1 && irqPassReg(r);
++		uint32_t n = pass ? ++gIrqWritePassed : ++gIrqWriteDropped;
++		if (gIrqWritePassed + gIrqWriteDropped <= 600 || n % 5000 == 0)
++			LOG("irq: %s raw write %x = %x (caller +%x, #%u)", pass ? "pass" : "drop", r, static_cast<uint32_t>(val),
++			    callerOff(__builtin_return_address(0)), n);
++		if (pass)
++			return reinterpret_cast<uint64_t (*)(uint64_t, uint64_t, uint64_t)>(orgRawWrite)(self, reg, val);
++		return 0;
++	}
+ 	if (stage2Dropped("raw write", r, val & 0xFFFFFFFF))  // every register, display or not
+ 		return 0;
+ 	eoi0Note(r, val & 0xFFFFFFFF);
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 30b2a2b..d2f03cb 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -237,19 +237,111 @@ static uint64_t wrapFbEnableControllerRefused(uint64_t fb, uint64_t, uint64_t, u
+ 	LOG("4a: AmdRadeonFramebuffer::enableController refused (kIOReturnUnsupported), Apple's DAL not run");
+ 	return 0xe00002c7;
+ }
+-// Apple's powerUp sends a second message: on the enableController of the last framebuffer
+-// (c0194cc-c019504) messageAccelerator(0x1b, NULL, 0, 0), "Controller is enabled, finish
+-// initialization" (be417d0): startGlobalPerfCounters, hardwareDidStart and
+-// AMDHardware::enableInterrupts. Not known yet whether the 610M survives its interrupts being
+-// turned on, so it is not sent during boot: this thread sends it once, when the NVRAM variable
+-// rmb-msg1b appears (sudo nvram rmb-msg1b=1, from SSH). A variable already there when the thread
+-// starts is ignored for the whole boot, so a forgotten one can never repeat this at every boot.
+-// The case takes the accelerator's own locks, like case 6; it does not need the framebuffer gates.
++// Patch 0025: the accelerator's interrupts, in Apple's order, fired from SSH instead of at boot.
++// Measured at the boot of 25/11 15:14 (patch 0024): the 610M executes Metal commands (buffer filled,
++// SDMA0 and GFX channels complete), but completion is only noticed by IOAccel's 5 s progress
++// watchdog, because nothing delivers the timestamp interrupts. AmdRadeonController::powerUp, which
++// 4a does not run, is the only caller of both steps:
++//   c01952f  wl = [ctrl+0xc0]->vt 0x688()
++//   c01977f  [ctrl+0x7978]->vt 0x120(wl)   AmdInterruptManager::startInterrupts (bfe49c0): IRQ
++//            library init, events registered with the work loop, setEnabled(true), MSI handler
++//            installed on the PCI device
++//   c01979a  [ctrl+0x5f18] |= 1
++//   c0194cc  on the last framebuffer: messageAccelerator(0x1b, NULL, 0, 0), "Controller is
++//            enabled, finish initialization" (be417d0): AMDHardware::enableInterrupts
++// NVRAM variables, each handled once per boot and ignored for the whole boot if already there when
++// the thread starts (so a forgotten one never repeats this at every boot):
++//   sudo nvram rmb-irq=1     startInterrupts, IH and GC/SDMA0 register writes pass (display.cpp)
++//   sudo nvram rmb-irq=d     the same call with every write still dropped, only logged
++//                            (any value not starting with 'd' means pass, "0" included)
++//   sudo nvram rmb-msg1b=1   message 0x1b; refused until rmb-irq=1 has run
++// A watchdog stops the ring (ihStopNow, disableInterrupt) if it storms or overflows.
++// Defined here, at global scope: display.cpp is wrapped in an anonymous namespace, and a definition
++// there leaves these names undefined for the rest of the kext (a kext link accepts that; the first
++// use page-faulted in ihSnap, panic of 25/11 15:48).
++volatile uint32_t gIrqWriteMode, gIrqWritePassed, gIrqWriteDropped;
++static void ihSnap(const char *when) {
++	char irq[200];
++	gpuIrqState(irq, sizeof(irq));
++	uint32_t c, e, st;
++	ihFlushStats(c, e, st);
++	LOG("irq %s: IH ring0 cntl %x base %x %x rptr %x wptr %x wpaddr %x %x; ring1 %x/%x/%x ring2 %x/%x/%x; pci %s; ihflush calls %u entries %u stale %u; raw writes passed %u dropped %u",
++	    when, mmioRead(0x1120), mmioRead(0x1121), mmioRead(0x1122), mmioRead(0x1123), mmioRead(0x1124), mmioRead(0x1125),
++	    mmioRead(0x1126), mmioRead(0x112c), mmioRead(0x112f), mmioRead(0x1130), mmioRead(0x1138), mmioRead(0x113b),
++	    mmioRead(0x113c), irq, c, e, st, gIrqWritePassed, gIrqWriteDropped);
++	for (uint32_t o = 0xa0; o < 0xe0; o += 8)
++		LOG("irq %s: osssys +%x: %x %x %x %x %x %x %x %x", when, o, mmioRead(0x10A0 + o), mmioRead(0x10A1 + o), mmioRead(0x10A2 + o),
++		    mmioRead(0x10A3 + o), mmioRead(0x10A4 + o), mmioRead(0x10A5 + o), mmioRead(0x10A6 + o), mmioRead(0x10A7 + o));
++	// SOC15 client ids: 4 DCE, 8 SDMA0, 0x12 VMC, 0x14 GRBM_CP (timestamp / EOP), 0x1b UTCL2.
++	char cl[224];
++	int k = 0;
++	cl[0] = 0;
++	for (uint32_t i = 0; i < 32 && k < static_cast<int>(sizeof(cl)) - 16; i++)
++		if (gIhClient[i])
++			k += snprintf(cl + k, sizeof(cl) - static_cast<size_t>(k), " %x:%u", i, gIhClient[i]);
++	LOG("irq %s: ring entries by client (hex id:count):%s", when, k ? cl : " none");
++}
++static uint64_t gIrqMgr;
++static bool irqStart(uint64_t ctrl, bool dry) {
++	auto vt = [](uint64_t o, uint32_t slot) { return (*reinterpret_cast<uint64_t **>(o))[slot / 8]; };
++	uint64_t im = *reinterpret_cast<uint64_t *>(ctrl + 0x7978), src = *reinterpret_cast<uint64_t *>(ctrl + 0xc0);
++	uint64_t wl = src ? reinterpret_cast<uint64_t (*)(uint64_t)>(vt(src, 0x688))(src) : 0;
++	if (!im || !wl) {
++		LOG("irq: no interrupt manager (%s) or work loop (%s): not started", im ? "set" : "NULL", wl ? "set" : "NULL");
++		return false;
++	}
++	gIrqMgr = im;
++	accelState4a(ctrl, "irq", "before");
++	ihSnap("before");
++	LOG("irq: calling AmdInterruptManager::startInterrupts, register writes %s; manager flags %x, controller flags %x",
++	    dry ? "all DROPPED and logged (rmb-irq=d)" : "to OSSSYS and GC/SDMA0 PASS, the rest dropped", *reinterpret_cast<uint8_t *>(im + 0x78),
++	    *reinterpret_cast<uint8_t *>(ctrl + 0x5f18));
++	gIrqWriteMode = dry ? 2 : 1;
++	auto r = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(vt(im, 0x120))(im, wl);
++	*reinterpret_cast<volatile uint8_t *>(ctrl + 0x5f18) |= 1;  // c01979a
++	LOG("irq: startInterrupts = %llx; manager flags %x, MSI source index %d, controller flags %x", r & 0xFFFFFFFF,
++	    *reinterpret_cast<uint8_t *>(im + 0x78), *reinterpret_cast<int32_t *>(im + 0x58), *reinterpret_cast<uint8_t *>(ctrl + 0x5f18));
++	IOSleep(200);
++	ihSnap("after");
++	return !(r & 0xFFFFFFFF);
++}
++// One step of the watchdog, every 100 ms: true once the ring had to be stopped.
++static bool irqWatch() {
++	static uint32_t lastCalls, lastEntries, quiet;
++	static bool stopped;
++	if (stopped || !gIrqMgr)
++		return stopped;
++	uint32_t c, e, st;
++	ihFlushStats(c, e, st);
++	uint32_t dc = c - lastCalls, de = e - lastEntries, wptr = mmioRead(0x1124);
++	lastCalls = c, lastEntries = e;
++	bool storm = dc > 2000 || de > 20000, overflow = wptr != 0xFFFFFFFF && (wptr & 1);
++	if (storm || overflow) {
++		stopped = true;
++		LOG("irq: WATCHDOG: %s (in 100 ms: %u get-wptr calls, %u entries; wptr %x): stopping the ring", storm ? "storm" : "ring overflow", dc, de, wptr);
++		ihStopNow(storm ? "storm" : "overflow");
++		auto pci = *reinterpret_cast<IOService **>(gIrqMgr + 0x30);
++		int idx = *reinterpret_cast<int32_t *>(gIrqMgr + 0x58);
++		if (pci && idx >= 0)
++			LOG("irq: WATCHDOG: disableInterrupt(%d) = %x", idx, pci->disableInterrupt(idx));
++		ihSnap("stopped");
++	} else if (++quiet % 600 == 0) {
++		ihSnap("alive");  // once a minute
++	}
++	return stopped;
++}
+ static void msg1bThread(void *, wait_result_t) {
+-	auto present = []() {
++	// -1: absent; otherwise the first byte of the value.
++	auto value = [](const char *name) {
++		int r = -1;
+ 		auto opts = IORegistryEntry::fromPath("/options", gIODTPlane);
+-		auto p = opts ? opts->copyProperty("rmb-msg1b") : nullptr;
+-		bool r = p != nullptr;
++		auto p = opts ? opts->copyProperty(name) : nullptr;
++		if (auto d = OSDynamicCast(OSData, p))
++			r = d->getLength() ? *static_cast<const uint8_t *>(d->getBytesNoCopy()) : 0;
++		else if (auto str = OSDynamicCast(OSString, p))
++			r = static_cast<uint8_t>(str->getChar(0));
++		else if (p)
++			r = 0;
+ 		OSSafeReleaseNULL(p);
+ 		OSSafeReleaseNULL(opts);
+ 		return r;
+@@ -257,32 +349,53 @@ static void msg1bThread(void *, wait_result_t) {
+ 	// No /options yet: a forgotten variable could not be told from a new request later, so don't arm.
+ 	auto opts = IORegistryEntry::fromPath("/options", gIODTPlane);
+ 	if (!opts) {
+-		LOG("4a: msg1b: /options not published yet, not armed for this boot");
++		LOG("4a: triggers: /options not published yet, not armed for this boot");
+ 		return;
+ 	}
+ 	opts->release();
+-	if (present()) {
+-		LOG("4a: msg1b: NVRAM variable rmb-msg1b already present at boot: ignored for this whole boot (sudo nvram -d rmb-msg1b)");
+-		return;
+-	}
+-	LOG("4a: msg1b: armed for 4 h: sudo nvram rmb-msg1b=1 sends accelerator message 0x1b once (interrupts on)");
+-	for (uint32_t i = 0; i < 4 * 3600 && !present(); i++)
+-		IOSleep(1000);
+-	if (!present()) {
+-		LOG("4a: msg1b: not requested within 4 h, thread done");
+-		return;
+-	}
+-	uint64_t ctrl = gCtrl4a;
+-	if (!ctrl || !orgMessageAccelerator || !orgDoesAcceleratorExist) {
+-		LOG("4a: msg1b: requested, but no controller seen by enableController or messageAccelerator not hooked: not sent");
+-		return;
++	bool irqDone = value("rmb-irq") >= 0, msgDone = value("rmb-msg1b") >= 0, irqLive = false, irqOk = false;
++	if (irqDone)
++		LOG("4a: triggers: NVRAM variable rmb-irq already present at boot: ignored for this whole boot (sudo nvram -d rmb-irq)");
++	if (msgDone)
++		LOG("4a: triggers: NVRAM variable rmb-msg1b already present at boot: ignored for this whole boot (sudo nvram -d rmb-msg1b)");
++	LOG("4a: triggers armed for 4 h:%s%s", irqDone ? "" : " rmb-irq=1 (startInterrupts) or rmb-irq=d (dry);", msgDone ? "" : " rmb-msg1b=1 (message 0x1b, after rmb-irq=1)");
++	for (uint32_t tick = 0; tick < 4 * 3600 * 10 && !(irqDone && msgDone && !irqLive); tick++) {
++		IOSleep(100);
++		if (irqLive && irqWatch())
++			irqLive = false;
++		if (tick % 10)
++			continue;
++		uint64_t ctrl = gCtrl4a;
++		if (!irqDone) {
++			int v = value("rmb-irq");
++			if (v >= 0) {
++				irqDone = true;
++				if (!ctrl)
++					LOG("irq: requested, but no controller was seen by enableController: not started");
++				else {
++					irqLive = v != 'd';  // watch whenever writes may pass, even if startInterrupts fails
++					irqOk = irqStart(ctrl, v == 'd') && irqLive;
++				}
++			}
++		}
++		if (!msgDone && value("rmb-msg1b") >= 0) {
++			msgDone = true;
++			if (!ctrl || !orgMessageAccelerator || !orgDoesAcceleratorExist) {
++				LOG("4a: msg1b: requested, but no controller seen by enableController or messageAccelerator not hooked: not sent");
++			} else if (!(irqLive && irqOk) && !checkKernelArgument("-rmbmsg1bfree")) {
++				LOG("4a: msg1b: refused: startInterrupts has not run with its writes passing (rmb-irq=1 first), or the ring was stopped");
++			} else {
++				accelState4a(ctrl, "msg1b", "before");
++				s3Sample("before msg1b");
++				auto r = wrapMessageAccelerator(reinterpret_cast<void *>(ctrl), 0x1b, 0, 0, 0, 0);
++				LOG("4a: msg1b sent, messageAccelerator(0x1b) = %llx (lo32 %llx)", r, r & 0xFFFFFFFF);
++				accelState4a(ctrl, "msg1b", "after");
++				s3Sample("after msg1b");
++				ihSnap("after msg1b");
++			}
++		}
+ 	}
+-	accelState4a(ctrl, "msg1b", "before");
+-	s3Sample("before msg1b");
+-	auto r = wrapMessageAccelerator(reinterpret_cast<void *>(ctrl), 0x1b, 0, 0, 0, 0);
+-	LOG("4a: msg1b sent, messageAccelerator(0x1b) = %llx (lo32 %llx)", r, r & 0xFFFFFFFF);
+-	accelState4a(ctrl, "msg1b", "after");
+-	s3Sample("after msg1b");
++	LOG("4a: triggers: thread done");
+ }
+ // Stage 2 / 3 fallback, used only when the headless routes or write-blocking register hooks could not all be installed.
+ static uint64_t wrapCtrlStartDeclined(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+@@ -1099,14 +1212,14 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0024, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0025, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+ 	    checkKernelArgument("-rmbgpuclean") ? "by GPU DMA (-rmbgpuclean)" : "by CPU",
+ 	    checkKernelArgument("-rmbutcl2harvest") ? "programmed (-rmbutcl2harvest)" : "not programmed",
+ 	    checkKernelArgument("-rmbfbstubs") ? "stubs kept, enableController refused (-rmbfbstubs, 4a)" : "none (headless)",
+-	    !checkKernelArgument("-rmbfbstubs") ? "not sent (no framebuffers)" : checkKernelArgument("-rmbnomsg6") ? "not sent (-rmbnomsg6)" : "sent at the first enableController; message 0x1b on NVRAM rmb-msg1b");
++	    !checkKernelArgument("-rmbfbstubs") ? "not sent (no framebuffers)" : checkKernelArgument("-rmbnomsg6") ? "not sent (-rmbnomsg6)" : "sent at the first enableController; interrupts on NVRAM rmb-irq, message 0x1b on NVRAM rmb-msg1b");
+ 	smuStage3BeforeHwInit();
+ 	s3Sample("before ttl_hw_init");
+ 	LOG(">> ttl_hw_init(%llx, %llx)", a, b);
+diff --git a/src/RembrandtGfx/mmio.cpp b/src/RembrandtGfx/mmio.cpp
+index ed9d383..d96536d 100644
+--- a/src/RembrandtGfx/mmio.cpp
++++ b/src/RembrandtGfx/mmio.cpp
+@@ -213,6 +213,22 @@ void quiesceIh(const char *why) {
+ 	}
+ }
+ 
++// Patch 0025: emergency stop for the interrupt ring, used only by the rmb-irq watchdog
++// (kern_start.cpp) when the ring storms or overflows right after Apple's startInterrupts. Same
++// writes as quiesceIh / Linux navi10_ih_disable_interrupts, without the stage guard: this is the
++// one OSSSYS write the kext itself makes in stage 3, and only to turn the ring off.
++void ihStopNow(const char *why) {
++	static constexpr uint32_t Base = 0x10A0;
++	static constexpr uint32_t cntls[] {0x80, 0x8c, 0x98};
++	if (!mapMmio())
++		return;
++	for (size_t i = 0; i < arrsize(cntls); i++) {
++		uint32_t before = gMmio[Base + cntls[i]];
++		gMmio[Base + cntls[i]] = before & ~((i == 0 ? 1U << 17 : 0U) | 1U);  // ENABLE_INTR (ring 0), RB_ENABLE
++		LOG("irq: STOP (%s): ring %zu cntl %08x -> %08x", why, i, before, gMmio[Base + cntls[i]]);
++	}
++}
++
+ static IONotifier *gPciNotifier;
+ static IOPCIDevice *gGpuPci;
+ static IOPCIAddressSpace gGpuSpace;
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 822b281..475d217 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -131,6 +131,12 @@ void displayRouteBacklight(KernelPatcher &patcher, size_t index, mach_vm_address
+ bool mmioAvailable();
+ // Disable + drain the IH rings left running by a previous VM run (INTx stuck asserted otherwise).
+ void quiesceIh(const char *why);
++// Patch 0025: turns the interrupt rings off, whatever the stage (rmb-irq watchdog only).
++void ihStopNow(const char *why);
++// Patch 0025: 0 = stage 2/3 drops every framebuffer-kext register write; 1 = OSSSYS (IH) and
++// GC/SDMA0 writes pass, the rest is dropped; 2 = everything dropped. In 1 and 2 each write is logged.
++extern volatile uint32_t gIrqWriteMode;
++extern volatile uint32_t gIrqWritePassed, gIrqWriteDropped;
+ void ihQuiesceAtBoot();
+ int gpuIrqState(char *buf, int n);
+ // get-wptr wrapper: calls, IH ring entries clflushed, entries that were stale in the CPU cache.
+-- 
+2.39.5 (Apple Git-154)
+

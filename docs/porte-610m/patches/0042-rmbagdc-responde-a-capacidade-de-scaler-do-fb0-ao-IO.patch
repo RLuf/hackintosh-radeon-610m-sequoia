@@ -1,0 +1,182 @@
+From 9e21f853b9bdd6c01cd36687b46984fafb795f63 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 21:21:25 -0300
+Subject: [PATCH 42/48] -rmbagdc responde a capacidade de scaler do fb0 ao
+ IOPresentment; -rmbgopflip reaponta o HUBP0 a cada 'amtr' (0038)
+
+Sem o tipo 0x10 o IOPresentment desiste ("Unable to acquire capabilities ... 0x2006") e nao manda transacao.
+Leiaute e flip em ~/fzdrv/rev/amtr/RELATORIO.md secoes 6-8.
+
+Co-authored-by: opus-fable
+---
+ src/RembrandtGfx/display.cpp    | 75 ++++++++++++++++++++++++++++++++-
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ src/RembrandtGfx/mmio.cpp       |  9 +++-
+ src/RembrandtGfx/rmb.hpp        |  3 ++
+ 4 files changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 63c502d..b9e5e05 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3441,6 +3441,14 @@ IOSimpleLock *gIrqLock;
+ volatile UInt32 gTxnPending[4];
+ volatile SInt32 gTxnSeen;
+ volatile uint32_t gTicks;
++// Patch 0038 (-rmbgopflip): each accepted 'amtr' flip repoints HUBP0 at the surface the accelerator
++// rendered. The address is the u64 at flip+0x8 (writeFlipParameters bec0c50 copies 0x68 bytes to
++// flip+8); accepted as an MC address inside the frame buffer, or as an offset from its base, and
++// only 256-byte aligned. HIGH then LOW, as Linux (dcn20_hubp.c: "program high first and then the
++// low addr, order matters!"). Counted here, logged by the tick thread.
++bool gFlipOn;
++volatile SInt32 gFlipOk, gFlipBad;
++volatile uint64_t gFlipLast, gFlipLastMc;
+ 
+ void tickThread(void *, wait_result_t) {
+ 	for (;;) {
+@@ -3469,7 +3477,8 @@ void tickThread(void *, wait_result_t) {
+ 			    x.flip[12], x.flip[13], x.flip[14], x.flip[15]);
+ 		}
+ 		if (gTicks == 600 || gTicks % 36000 == 0)
+-			LOG("gopfb: tick %u, amtr transactions seen %u", gTicks, gTxnSeen);
++			LOG("gopfb: tick %u, amtr transactions seen %u; flips written %d rejected %d, last surface %llx -> mc %llx", gTicks,
++			    gTxnSeen, gFlipOk, gFlipBad, gFlipLast, gFlipLastMc);
+ 	}
+ }
+ 
+@@ -3764,6 +3773,23 @@ IOReturn setAttribute(void *fb, IOSelect sel, uintptr_t value) {
+ 				memcpy(snap.flip, reinterpret_cast<const void *>(t[2]), sizeof(snap.flip));
+ 			snap.ready = true;
+ 		}
++		if (gFlipOn && i == 0 && gMode.ok && gMode.fbBaseMc && (t[0] & 1) && t[2] >= 0xffffff8000000000ULL) {
++			uint64_t a = *reinterpret_cast<const uint64_t *>(t[2] + 8);
++			constexpr uint64_t Vram = 0x80000000ULL;  // 2 GB carve-out
++			uint64_t need = static_cast<uint64_t>(gMode.rowBytes) * gMode.h, base = gMode.fbBaseMc, mc = 0;
++			if (a >= base && a + need <= base + Vram)
++				mc = a;
++			else if (a + need <= Vram)
++				mc = base + a;
++			gFlipLast = a;
++			if (mc && !(mc & 0xff)) {
++				mmioWrite(0x3acb, static_cast<uint32_t>(mc >> 32) & 0xffff);
++				mmioWrite(0x3aca, static_cast<uint32_t>(mc));
++				gFlipLastMc = mc;
++				OSIncrementAtomic(&gFlipOk);
++			} else
++				OSIncrementAtomic(&gFlipBad);
++		}
+ 		if (i >= 0 && i < 4)
+ 			gTxnPending[i] = 1;  // retired by the next tick ('txni')
+ 		return kIOReturnSuccess;
+@@ -3836,6 +3862,42 @@ IOReturn setInterruptState(void *fb, void *ref, UInt32 state) {
+ 	return kIOReturnSuccess;
+ }
+ 
++// Patch 0038 (-rmbgopfb with -rmbagdc): IOPresentment asks the AGDC for each pipe's capabilities
++// (AGDC 0x711, type by type); only type 0x10 (scaler) is mandatory, a failure there ends in
++// "Unable to acquire capabilities ... 0x2006" and no transaction is ever sent. Apple's
++// AmdAgdcServices::getFbExtendedCapability (bfecb62) refuses because the DAL display path is not
++// programmed (path+0x719 == 0). Answer fb 0 / type 0x10 with the entry Apple builds in its
++// "no scaler" branch (getFbCapabilityForScaler +0x14c..+0x1ae), sized from the inherited mode;
++// every other fb and type goes to Apple's function (fb1/fb2 offline, no hardware cursor).
++mach_vm_address_t gfbOrgAgdcExtCap;
++IOReturn agdcExtCap(void *agdc, uint8_t *req, size_t size) {
++	static uint32_t calls;
++	uint32_t c = ++calls;
++	if (!req || size < 0x338 || !gMode.ok || req[0] != 0 || *reinterpret_cast<uint32_t *>(req + 4) != 0x10) {
++		auto r = reinterpret_cast<IOReturn (*)(void *, uint8_t *, size_t)>(gfbOrgAgdcExtCap)(agdc, req, size);
++		if (c <= 40)
++			LOG("gopfb: agdc 0x711 fb %u type %x size %lx -> Apple's %x", req ? req[0] : 0xff, req ? *reinterpret_cast<uint32_t *>(req + 4) : 0,
++			    size, r);
++		return r;
++	}
++	auto put32 = [](uint8_t *p, uint32_t v) { *reinterpret_cast<uint32_t *>(p) = v; };
++	auto put64 = [](uint8_t *p, uint64_t v) { *reinterpret_cast<uint64_t *>(p) = v; };
++	uint32_t w = gMode.w, h = gMode.h;
++	uint8_t *E = req + 0xc;
++	memset(E + 8, 0, 0x324);
++	put32(req + 8, 1);
++	put64(E + 0x00, 0x80004ULL);  // movq $0x80004, (%rbx) at +0x76: E+0 = 0x80004, E+4 = 0
++	put64(E + 0x1c, 1);
++	put32(E + 0x24, h), put32(E + 0x28, w), put32(E + 0x2c, h), put32(E + 0x30, w);
++	put64(E + 0x34, 0x0000000400050005ULL);
++	put64(E + 0x1a4, 1);
++	put32(E + 0x1ac, h), put32(E + 0x1b0, w), put32(E + 0x1b4, h), put32(E + 0x1b8, w);
++	put64(E + 0x1bc, 0x0000000400050005ULL);
++	if (c <= 40)
++		LOG("gopfb: agdc 0x711 fb 0 type 10 size %lx -> scaler answered %ux%u", size, w, h);
++	return kIOReturnSuccess;
++}
++
+ }  // namespace gopfb
+ 
+ bool displayGopFbOn() { return gopfb::gOn; }
+@@ -3889,6 +3951,17 @@ void displayRouteGopFb(KernelPatcher &patcher, size_t index, mach_vm_address_t a
+ 		patcher.clearError();
+ 	}
+ 	gRouted = routed == arrsize(reqs) && gIrqLock;
++	if (checkKernelArgument("-rmbagdc")) {
++		KernelPatcher::RouteRequest capReq {"__ZNK30AMDRadeonX6000_AmdAgdcServices23getFbExtendedCapabilityEP29AGDCFBGetExtendedCapability_tm",
++			agdcExtCap, gfbOrgAgdcExtCap};
++		if (patcher.routeMultiple(index, &capReq, 1, address, size))
++			LOG("gopfb: AGDC getFbExtendedCapability routed (fb 0 scaler answered from the inherited mode)");
++		else
++			LOG("gopfb: failed to route getFbExtendedCapability (err %d)", patcher.getError());
++		patcher.clearError();
++	}
++	gFlipOn = gGopFlipWrites = gRouted && checkKernelArgument("-rmbgopflip");
++	LOG("gopfb: HUBP0 flip on 'amtr' %s", gFlipOn ? "ON (only 0x3aca/0x3acb)" : "off");
+ 	// Patch 0028c: boot of 26/11 00:19 hung at 248.97 s in _engine_initialize -> _engine_vcn_fw_loaded
+ 	// (1 s timeout) while VTDecoderXPCService decoded video, then VMPT/SDMA0 never completed
+ 	// (POLL_REGMEM) and watchdogd panicked. The upstream guard (noVideoEngine, VideoToolbox in
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 6d3ff6f..e051f54 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1317,7 +1317,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0037, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0038, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/mmio.cpp b/src/RembrandtGfx/mmio.cpp
+index 9308831..0d42580 100644
+--- a/src/RembrandtGfx/mmio.cpp
++++ b/src/RembrandtGfx/mmio.cpp
+@@ -74,8 +74,15 @@ static bool stage3MayWrite(uint32_t reg) {
+ 	        reg == 0x16000 + 0x282 || reg == 0x16000 + 0x292 || reg == 0x16000 + 0x29a);
+ }
+ 
++// Patch 0038 (-rmbgopflip): HUBP0 DCSURF_PRIMARY_SURFACE_ADDRESS / _HIGH (0x34C0 + 0x60a / 0x60b,
++// dcn_3_1_6_offset.h), written by gopfb's 'amtr' flip. Nothing else of the DCN.
++bool gGopFlipWrites;
++static bool gopFlipMayWrite(uint32_t reg) {
++	return gGopFlipWrites && rmbStage() == 3 && rmbStage3Armed() && (reg == 0x3aca || reg == 0x3acb);
++}
++
+ void mmioWrite(uint32_t reg, uint32_t value) {
+-	if (rmbProbe() && !stage2MayWrite(reg, value) && !stage3MayWrite(reg)) {  // stages 1-3: only what the stage lists
++	if (rmbProbe() && !stage2MayWrite(reg, value) && !stage3MayWrite(reg) && !gopFlipMayWrite(reg)) {  // stages 1-3: only what the stage lists
+ 		static uint32_t dropped;
+ 		if (dropped++ < 40)
+ 			LOG("mmio: stage %u dropped write %x = %x (#%u)", rmbStage(), reg, value, dropped);
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index 801dbaf..771ef50 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -56,6 +56,9 @@ using Fn6 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint6
+ // GPU register aperture (BAR5, 512 KB), mapped on first use. Offsets are dword indices.
+ uint32_t mmioRead(uint32_t reg);
+ void mmioWrite(uint32_t reg, uint32_t value);
++// Patch 0038: set by display.cpp (gopfb) with -rmbgopflip; lets stage 3 write HUBP0's primary surface
++// address (0x3aca/0x3acb) and nothing else of the display engine. Defined in mmio.cpp.
++extern bool gGopFlipWrites;
+ void applyGcGolden();
+ void haltGfxEngines(const char *why);
+ void smuExitReset(const char *tag);
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Mon, 23 Nov 2026 11:01:02 -0800
+Subject: [PATCH] fix: estagio 2 zera createFbStubs no modo headless para
+ concluir o handshake do AmdTtlServices
+
+No macOS 15.8.1, recusar AmdRadeonFramebuffer::start() faz
+AmdRadeonController::createFbStubs() falhar no stub 0 (0xe00002bc) e
+abortar Controller::start() antes de setupHwServices(). Sem essa primeira
+chamada do controlador a AmdTtlServices::initialize() (gravando this->0x578),
+a segunda chamada feita pelo acelerador falha com TtlInitialize = 0xe00002bc
+sem chegar a ttl_sw_init / ttl_hw_init.
+
+Passar count = 0 para createFbStubs() usa o caminho nativo da funcao que
+retorna 0 sem alocar nem iniciar nenhum framebuffer (this->0xbd = 0),
+mantendo wrapFbStart e os 6 ganchos de descarte de escrita ativos.
+Adicionalmente:
+- Rastreia input->0x10 em wrap_TtlInitialize para confirmar no log o campo
+  preenchido na chamada 1 (controlador) e nulo na chamada 2 (acelerador).
+- Condiciona AmdRadeonController::start no Estagio 2/3 a gFbStagedOk (exigindo
+  wrapFbStart, wrapCreateFbStubsZero e os 6 ganchos de escrita instalados).
+---
+ src/RembrandtGfx/kern_start.cpp | 36 ++++++++++++++++++++++++---------
+ 1 file changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 142e4cc..d601022 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -79,7 +79,14 @@ TRACE_HOOK(ttlDevCreateInstance)
+ TRACE_HOOK(ttl_cgs_initialize)
+ TRACE_HOOK(validateCosInfo)
+ TRACE_HOOK(ttl_initialize)
+-TRACE_HOOK(TtlInitialize)
++static mach_vm_address_t org_TtlInitialize;
++static uint64_t wrap_TtlInitialize(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	uint64_t in10 = b ? *reinterpret_cast<const uint64_t *>(b + 0x10) : 0;
++	LOG(">> TtlInitialize(%llx, %llx) in10=%llx", a, b, in10);
++	auto r = reinterpret_cast<Fn6>(org_TtlInitialize)(a, b, c, d, e, f);
++	LOG("<< TtlInitialize = %llx", r);
++	return r;
++}
+ TRACE_HOOK(TtlServicesInitialize)
+ TRACE_HOOK(TtlInitializeCos)
+ TRACE_HOOK(TtlInitializeGmm)
+@@ -170,15 +177,20 @@ static uint64_t wrapVendorAttr(uint64_t self, uint64_t attr, uint64_t in, uint64
+ // -rmbheadless: publish no AMD framebuffers. The display engine (DCN 3.1) isn't supported yet, so
+ // WindowServer stays on the emulated display and the 680M is used as a display-less (Metal) GPU.
+ static bool gHeadless;
++static mach_vm_address_t orgCreateFbStubs;
+ static uint64_t wrapFbStart(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+ 	LOG("headless: AmdRadeonFramebuffer start declined");
+ 	return 0;
+ }
++static uint64_t wrapCreateFbStubsZero(uint64_t ctrl, uint64_t count, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	LOG("headless: createFbStubs(%llu) -> 0 stubs", count & 0xFF);
++	return reinterpret_cast<Fn6>(orgCreateFbStubs)(ctrl, 0, c, d, e, f);
++}
+ // Stages 2 and 3: the headless route and all six write-dropping register hooks are in place.
+ static bool gFbStagedOk;
+-// Stage 2 / 3 fallback, used only when the write-blocking register hooks could not all be installed.
++// Stage 2 / 3 fallback, used only when the headless routes or write-blocking register hooks could not all be installed.
+ static uint64_t wrapCtrlStartDeclined(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+-	LOG("stage %u: AmdRadeonController start declined (register hooks missing)", rmbStage());
++	LOG("stage %u: AmdRadeonController start declined (headless or register hooks missing)", rmbStage());
+ 	return 0;
+ }
+ 
+@@ -483,17 +495,23 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 	}
+ 	gHeadless = s2 || checkKernelArgument("-rmbheadless");
+ 	if (gHeadless) {
+-		KernelPatcher::RouteRequest req {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer5startEP9IOService", wrapFbStart};
+-		if (!patcher.routeMultiple(index, &req, 1, address, size))
++		KernelPatcher::RouteRequest fbReq {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer5startEP9IOService", wrapFbStart};
++		KernelPatcher::RouteRequest stubReq {"__ZN34AMDRadeonX6000_AmdRadeonController13createFbStubsEh", wrapCreateFbStubsZero, orgCreateFbStubs};
++		bool fbOk = patcher.routeMultiple(index, &fbReq, 1, address, size);
++		if (!fbOk)
+ 			LOG("headless: failed to route framebuffer start (err %d)", patcher.getError());
+-		else {
+-			LOG("headless: framebuffers disabled");
++		patcher.clearError();
++		bool stubOk = patcher.routeMultiple(index, &stubReq, 1, address, size);
++		if (!stubOk)
++			LOG("headless: failed to route createFbStubs (err %d)", patcher.getError());
++		patcher.clearError();
++		if (fbOk && stubOk) {
++			LOG("headless: framebuffers disabled (0 stubs)");
+ 			gFbStagedOk = s2WritesBlocked;
+ 		}
+-		patcher.clearError();
+ 	}
+ 	KernelPatcher::RouteRequest traces[] {
+-		{"__ZN34AMDRadeonX6000_AmdRadeonController5startEP9IOService", s2 && !s2WritesBlocked ? wrapCtrlStartDeclined : wrap_CtrlStart, org_CtrlStart},
++		{"__ZN34AMDRadeonX6000_AmdRadeonController5startEP9IOService", s2 && !gFbStagedOk ? wrapCtrlStartDeclined : wrap_CtrlStart, org_CtrlStart},
+ 		{"__ZN34AMDRadeonX6000_AmdRadeonController19initializeInternalsEP9IOService", wrap_CtrlInitInternals, org_CtrlInitInternals},
+ 		{"__ZN34AMDRadeonX6000_AmdRadeonController7powerUpEv", wrap_CtrlPowerUp, org_CtrlPowerUp},
+ 		{"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer16enableControllerEv", wrap_FbEnableController, org_FbEnableController},
+-- 
+2.39.5 (Apple Git-154)
+

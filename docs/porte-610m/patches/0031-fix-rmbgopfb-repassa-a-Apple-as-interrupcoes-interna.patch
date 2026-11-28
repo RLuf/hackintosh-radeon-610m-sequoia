@@ -1,0 +1,108 @@
+From c02209b4d52b19936e0dd22ce0ce1431ac636641 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 00:47:24 -0300
+Subject: [PATCH 31/48] fix: -rmbgopfb repassa a Apple as interrupcoes internas
+ da GPU (0028d)
+
+Boot de 26/11 00:37 (0028c): login aceito, mas a tela anda aos trancos e
+congela. O anel de interrupcoes ficou vazio o boot inteiro (IH ring0 rptr =
+wptr = 0, ihflush calls 0, nenhum cliente) e as 7 escritas da mensagem 0x1b
+(306a, 3085-3088, 127c, 187c) nao sairam; os canais 10/12/18/35/36 so andavam
+pelo vigia de 5 s do IOAccelEventMachineFast2 (Signaling hardware error,
+GPURestartSkipped) e o teste Metal levou 879 ms (1,8 ms no 0026).
+
+Causa: o AmdRadeonFramebuffer::registerForInterruptType da Apple tambem
+registra as fontes de interrupcao do acelerador (tipos abaixo de 0x20000000:
+0x6004, 0xff0152-0xff0155, 0xff033e/f, 0xff03de/f, 0xff03e8/9, 0xff13), e a
+rota do 0028 recusava tudo que nao fosse 'vbl '/'fstr'/'txni'.
+
+Agora esses tipos vao para a funcao original, e unregisterInterrupt e
+setInterruptState tambem, quando a referencia nao e do gopfb.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/display.cpp    | 25 ++++++++++++++++++++-----
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index e596745..5996c58 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3475,6 +3475,13 @@ void tickThread(void *, wait_result_t) {
+ 
+ // --- the routed virtuals (signatures from the 15.8.1 AMDRadeonX6000_AmdRadeonFramebuffer symbols)
+ mach_vm_address_t gfbOrgGetAttr, gfbOrgSetAttr;
++// Patch 0028d: AmdRadeonFramebuffer::registerForInterruptType also carries the accelerator's own GPU
++// interrupt sources (types below 0x20000000, cmpl at +0xc1/+0x186 of Apple's function: 0x6004,
++// 0xff0152-0xff0155, 0xff033e/f, 0xff03de/f, 0xff03e8/9, 0xff13 on the boot of 26/11 00:37). The 0028
++// refused them, so CP/SDMA completion interrupts were never enabled (IH ring0 rptr = wptr = 0, no
++// 0x1b writes 306a/3085-3088/127c/187c) and every channel only moved on the 5 s watchdog. Those go
++// to Apple's implementation, and so do unregister/setState for references that are not ours.
++mach_vm_address_t gfbOrgRegIrq, gfbOrgUnregIrq, gfbOrgSetIrqState;
+ 
+ // WindowServer may open the stubs before stage4aOpen samples (boot of 25/11 14:41: three opens at
+ // 44.87 s, before the kext's own): sample here once if needed, inside the first enableController.
+@@ -3776,6 +3783,12 @@ IOReturn setAttribute(void *fb, IOSelect sel, uintptr_t value) {
+ IOReturn registerForInterruptType(void *fb, IOSelect type, void (*proc)(OSObject *, void *), OSObject *target, void *ref,
+                                   void **interruptRef) {
+ 	first(25, "registerForInterruptType", fb, type);
++	if (type < 0x20000000) {  // GPU interrupt source of the accelerator, not an IOFramebuffer type
++		auto r = reinterpret_cast<IOReturn (*)(void *, IOSelect, void (*)(OSObject *, void *), OSObject *, void *, void **)>(
++		    gfbOrgRegIrq)(fb, type, proc, target, ref, interruptRef);
++		LOG("gopfb: registerForInterruptType(fb%d, source %#x) -> Apple's = %x", fbIndex(fb), type, r);
++		return r;
++	}
+ 	LOG("gopfb: registerForInterruptType(fb%d, '%c%c%c%c')", fbIndex(fb), (type >> 24) & 0xff, (type >> 16) & 0xff,
+ 	    (type >> 8) & 0xff, type & 0xff);
+ 	if (type != 'vbl ' && type != 'fstr' && type != 'txni')
+@@ -3798,7 +3811,7 @@ IOReturn unregisterInterrupt(void *fb, void *ref) {
+ 	first(26, "unregisterInterrupt", fb);
+ 	auto q = static_cast<Irq *>(ref);
+ 	if (q < gIrq || q >= gIrq + arrsize(gIrq))
+-		return kIOReturnBadArgument;
++		return reinterpret_cast<IOReturn (*)(void *, void *)>(gfbOrgUnregIrq)(fb, ref);  // Apple's source
+ 	q->on = false;
+ 	q->used = false;
+ 	return kIOReturnSuccess;
+@@ -3806,7 +3819,9 @@ IOReturn unregisterInterrupt(void *fb, void *ref) {
+ IOReturn setInterruptState(void *fb, void *ref, UInt32 state) {
+ 	first(27, "setInterruptState", fb, state);
+ 	auto q = static_cast<Irq *>(ref);
+-	if (q < gIrq || q >= gIrq + arrsize(gIrq) || !q->used)
++	if (q < gIrq || q >= gIrq + arrsize(gIrq))
++		return reinterpret_cast<IOReturn (*)(void *, void *, UInt32)>(gfbOrgSetIrqState)(fb, ref, state);  // Apple's source
++	if (!q->used)
+ 		return kIOReturnBadArgument;
+ 	q->on = state != 0;
+ 	return kIOReturnSuccess;
+@@ -3851,9 +3866,9 @@ void displayRouteGopFb(KernelPatcher &patcher, size_t index, mach_vm_address_t a
+ 		{FBSYM("14setCursorStateEiib"), setCursorState},
+ 		{FBSYM("12getAttributeEjPm"), getAttribute, gfbOrgGetAttr},
+ 		{FBSYM("12setAttributeEjm"), setAttribute, gfbOrgSetAttr},
+-		{FBSYM("24registerForInterruptTypeEjPFvP8OSObjectPvES1_S2_PS2_"), registerForInterruptType},
+-		{FBSYM("19unregisterInterruptEPv"), unregisterInterrupt},
+-		{FBSYM("17setInterruptStateEPvj"), setInterruptState},
++		{FBSYM("24registerForInterruptTypeEjPFvP8OSObjectPvES1_S2_PS2_"), registerForInterruptType, gfbOrgRegIrq},
++		{FBSYM("19unregisterInterruptEPv"), unregisterInterrupt, gfbOrgUnregIrq},
++		{FBSYM("17setInterruptStateEPvj"), setInterruptState, gfbOrgSetIrqState},
+ 	};
+ #undef FBSYM
+ 	size_t routed = 0;
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index fc4a3d9..85f39e7 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0028c, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0028d, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+-- 
+2.39.5 (Apple Git-154)
+

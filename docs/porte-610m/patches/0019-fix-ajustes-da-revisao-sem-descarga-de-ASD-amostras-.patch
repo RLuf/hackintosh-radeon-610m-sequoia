@@ -1,0 +1,154 @@
+From 1c3e58bde01ddee3715c09fdb91f1c1f935443db Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 18:21:12 -0800
+Subject: [PATCH 19/48] fix: ajustes da revisao: sem descarga de ASD, amostras
+ em volta dos aneis do PSP, tos so em envio sincrono
+
+Achados do agente revisor sobre os patches 0016 a 0018:
+- _psp_asd_unload nao envia a descarga quando o ASD nao foi enviado (o Linux
+  faz o mesmo em psp_asd_terminate); antes a descarga de uma sessao que nunca
+  existiu era recusada pela TOS.
+- comentario do ASD corrigido: a base e a recusa da TOS 13.0.8, nao uma
+  afirmacao sobre o Linux que nao foi conferida (psp_13_0_8_ta.bin nao esta
+  nesta maquina).
+- amostras s3 antes e depois do censo do GART, do DESTROY_RINGS que o proprio
+  kext envia e da criacao do anel KM: e nessa janela que o processador de
+  comandos fica ocupado (GRBM 3028 -> a0003028).
+- a resposta da TOS so e lida quando o envio e sincrono (4o argumento zero).
+- o log do golden nao imprime mais um retorno que a funcao nao define.
+- linha de versao do estagio 3 passa a dizer patch 0019.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSo88Xro5AsvDqwXSnr
+---
+ src/RembrandtGfx/firmware.cpp   |  4 ++-
+ src/RembrandtGfx/kern_start.cpp | 44 ++++++++++++++++++++++++++-------
+ 2 files changed, 38 insertions(+), 10 deletions(-)
+
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index 690be8e..92f2442 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -239,7 +239,9 @@ uint64_t wrapPspCmdKmSubmit(uint64_t psp, uint64_t inBuf, uint64_t outResp, uint
+ 	auto r = reinterpret_cast<Fn6>(orgPspCmdKmSubmit)(psp, inBuf, outResp, d, e, f);
+ 	// The submit's return is 0 even when the TOS refuses the command; the TOS answer is the first
+ 	// dword of the response (status, then session id at +4: _psp_asd_load reads the id from there).
+-	uint32_t tos = outResp ? *reinterpret_cast<const uint32_t *>(outResp) : 0xFFFFFFFF;
++	// With a non-zero 4th argument the submit returns without waiting and leaves the response
++	// untouched: there is nothing to read then (tos shows ffffffff).
++	uint32_t tos = (outResp && !d) ? *reinterpret_cast<const uint32_t *>(outResp) : 0xFFFFFFFF;
+ 	if (rmbStage() == 3 || rmbVerbose() || (r & 0xFFFFFFFF)) {
+ 		if (cmd == 0xd) {
+ 			LOG("psp-km: AUTOLOAD_RLC (0xd) ret=%llx tos=%x; RLC_CNTL=%x RLC_STAT=%x BOOTLOAD=%x CP_STAT=%x GRBM=%x",
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 4e4b7bf..d779bf5 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -670,18 +670,29 @@ static void pspDestroyRings() {
+ 	LOG("psp: destroy rings -> C2PMSG_64 %08x", mmioRead(c2pmsg64));
+ }
+ 
++static void s3Sample(const char *when);  // stage 3 measurement, defined below
++
+ static mach_vm_address_t org_psp_ring_create;
+ static uint64_t wrap_psp_ring_create(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	dumpPspMailbox("before ring create");
++	// The command processor goes busy somewhere between "before hw init" (GRBM 3028) and the TOC
++	// (GRBM a0003028); the ring teardown and creation are in that window. Sample around each.
++	if (b == 2)
++		s3Sample("before gart census");
+ 	if (b == 2)
+ 		gartCensus("before KM ring create");
+ 	// Only before the KM ring (type 2), which HWLibs creates first: DESTROY_RINGS tears down every
+ 	// ring, including the KM ring HWLibs created moments ago when it later creates the UM ring (type 1).
+ 	// Every time, not once per boot: the PSP keeps its rings across guest S3 + host S3, and the wake
+ 	// powerUp's KM ring create fails against the stale one.
+-	if (b == 2)
++	if (b == 2) {
++		s3Sample("before destroy rings");
+ 		pspDestroyRings();
++		s3Sample("after destroy rings");
++	}
+ 	auto r = reinterpret_cast<Fn6>(org_psp_ring_create)(a, b, c, d, e, f);
++	if (b == 2)
++		s3Sample("after KM ring create");
+ 	dumpPspMailbox("after ring create");
+ 	LOG("psp_ring_create(type %llu) = %llx", b, r & 0xFFFFFFFF);
+ 	return r;
+@@ -957,7 +968,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0017, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s",
++	LOG("stage 3: kext patch 0019, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped");
+@@ -993,19 +1004,33 @@ static uint64_t stage3_psp_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ // Each has a boot-arg that restores Apple's Navi 23 behaviour.
+ 
+ // (a) _psp_asd_load sends the Navi 23 ASD embedded in HWLibs (_psp_asd_bin, command 0x4). The
+-// 13.0.8 TOS refuses it in every stage 3 boot (event 0x140402, tag 0x7). Linux has no separate ASD
+-// for 13.0.8 (psp_v13_0.c loads only the TOC and the TA bin) and psp_asd_initialize returns 0 when
+-// there is none. Do the same: report success without sending. -rmbsendasd: send it as Apple does.
+-static mach_vm_address_t org_psp_asd_load;
++// 13.0.8 TOS refuses it in every stage 3 boot (event 0x140402, tag 0x7), and HWLibs carries on as
++// if it had loaded. Do not send an image the TOS refuses: report success without sending, which is
++// also what _psp_asd_load itself does when psp+0x28 has bits 0x6 set. (Whether Linux ships an ASD
++// for 13.0.8 inside psp_13_0_8_ta.bin has not been checked: that file is not on this machine.)
++// With no ASD session, _psp_asd_unload must not send its unload either (Linux psp_asd_terminate
++// returns early when the ASD was never initialised). -rmbsendasd: send and unload as Apple does.
++static bool gAsdSkipped;
++static mach_vm_address_t org_psp_asd_load, org_psp_asd_unload;
+ static uint64_t wrap_psp_asd_load(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	if (gcHwVersion() == 0xa0307 && !checkKernelArgument("-rmbsendasd")) {
+-		LOG("psp: 610M: Navi 23 ASD not sent (PSP 13.0.8 has no separate ASD), returning 0");
++		gAsdSkipped = true;
++		LOG("psp: 610M: Navi 23 ASD not sent (the 13.0.8 TOS refuses it), returning 0");
+ 		return 0;
+ 	}
+ 	auto r = reinterpret_cast<Fn6>(org_psp_asd_load)(a, b, c, d, e, f);
+ 	LOG("psp: asd_load = %llx", r & 0xFFFFFFFF);
+ 	return r;
+ }
++static uint64_t wrap_psp_asd_unload(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	if (gAsdSkipped) {
++		LOG("psp: 610M: ASD unload not sent (no ASD session), returning 0");
++		return 0;
++	}
++	auto r = reinterpret_cast<Fn6>(org_psp_asd_unload)(a, b, c, d, e, f);
++	LOG("psp: asd_unload = %llx", r & 0xFFFFFFFF);
++	return r;
++}
+ 
+ // (b) _gc_check_grbm_cam_remap_10_3 writes a test pattern and, when it does not read back, the
+ // Navi 23 path programs GRBM_CAM_INDEX/DATA. On this APU that access is refused (RSMU security
+@@ -1028,7 +1053,7 @@ static uint64_t wrap_gc_check_grbm_cam_remap_10_3(uint64_t a, uint64_t b, uint64
+ static mach_vm_address_t org_gc_golden_settings_execution;
+ static uint64_t wrap_gc_golden_settings_execution(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+ 	auto r = reinterpret_cast<Fn6>(org_gc_golden_settings_execution)(a, b, c, d, e, f);
+-	LOG("golden: after gc_golden_settings_execution (%llx)", r & 0xFFFFFFFF);
++	LOG("golden: after gc_golden_settings_execution");  // the function sets no return value
+ 	applyGcGolden();
+ 	return r;
+ }
+@@ -1121,6 +1146,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 			{"_gvm_cos_write_amdlog", wrap_gvm_cos_write_amdlog, org_gvm_cos_write_amdlog},
+ 			// 610M fixes (patch 0017), same prologue check.
+ 			{"_psp_asd_load", wrap_psp_asd_load, org_psp_asd_load},
++			{"_psp_asd_unload", wrap_psp_asd_unload, org_psp_asd_unload},
+ 			{"_gc_check_grbm_cam_remap_10_3", wrap_gc_check_grbm_cam_remap_10_3, org_gc_check_grbm_cam_remap_10_3},
+ 			{"_gc_golden_settings_execution", wrap_gc_golden_settings_execution, org_gc_golden_settings_execution},
+ 		};
+@@ -1132,7 +1158,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 				LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
+ 			patcher.clearError();
+ 		}
+-		LOG("stage 3: %u of 6 stage-3 hooks installed (3 measurement, 3 fixes: asd, cam, golden)", routed);
++		LOG("stage 3: %u of 7 stage-3 hooks installed (3 measurement, 4 fixes: asd load, asd unload, cam, golden)", routed);
+ 		LOG("stage 3: ttl_hw_init runs only if the preflight passes; wake POST hooks not installed");
+ 	}
+ 	LOG("HWLibs hooks installed");
+-- 
+2.39.5 (Apple Git-154)
+

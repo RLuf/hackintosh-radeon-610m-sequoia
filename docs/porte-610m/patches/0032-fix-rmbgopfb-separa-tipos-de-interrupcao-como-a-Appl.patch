@@ -1,0 +1,51 @@
+From 5905356d2f43c8412010d8efd551acc7cbdd2383 Mon Sep 17 00:00:00 2001
+From: Roger Luft <rluft@pop.local>
+Date: Thu, 26 Nov 2026 00:54:55 -0300
+Subject: [PATCH 32/48] fix: -rmbgopfb separa tipos de interrupcao como a Apple
+ (bytes imprimiveis) (0028e)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/display.cpp    | 11 ++++++++++-
+ src/RembrandtGfx/kern_start.cpp |  2 +-
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 5996c58..63c502d 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3783,7 +3783,16 @@ IOReturn setAttribute(void *fb, IOSelect sel, uintptr_t value) {
+ IOReturn registerForInterruptType(void *fb, IOSelect type, void (*proc)(OSObject *, void *), OSObject *target, void *ref,
+                                   void **interruptRef) {
+ 	first(25, "registerForInterruptType", fb, type);
+-	if (type < 0x20000000) {  // GPU interrupt source of the accelerator, not an IOFramebuffer type
++	// Apple's registerForInterruptType looks every type up in its own interrupt table ([fb+0x8a58]->0x150) and
++	// only falls to "Interrupt Type Not Found" when it is missing; its 0x20000000 test only picks '.' for the log.
++	// Four printable bytes = IOFramebuffer type (handled here); anything else = GPU source of the accelerator.
++	auto printable = [](IOSelect t) {
++		for (int s = 0; s < 32; s += 8)
++			if (((t >> s) & 0xff) < 0x20 || ((t >> s) & 0xff) > 0x7e)
++				return false;
++		return true;
++	};
++	if (!printable(type)) {  // GPU interrupt source of the accelerator, not an IOFramebuffer type
+ 		auto r = reinterpret_cast<IOReturn (*)(void *, IOSelect, void (*)(OSObject *, void *), OSObject *, void *, void **)>(
+ 		    gfbOrgRegIrq)(fb, type, proc, target, ref, interruptRef);
+ 		LOG("gopfb: registerForInterruptType(fb%d, source %#x) -> Apple's = %x", fbIndex(fb), type, r);
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 85f39e7..b5da528 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -1288,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0028d, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0028e, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+-- 
+2.39.5 (Apple Git-154)
+

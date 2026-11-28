@@ -1,0 +1,194 @@
+From 24c3c8a1e11bfca36df025363868b9a2e431e224 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Wed, 25 Nov 2026 14:56:44 -0800
+Subject: [PATCH 24/48] fix: subestagio 4a manda a mensagem 6 ao acelerador
+ (powerUpHW), como o powerUp da Apple
+
+Medido no boot de 25/11 14:17 (kext patch 0023, -rmbfbstubs): o acelerador
+habilitou (accel flags 2, enabled 1, vram desc set), e o primeiro comando Metal
+derrubou o kernel em AMDHWVMM::endVMPTUpdate()+0x13, com [vmm+0x28] nulo.
+
+Conferido por desmontagem (15.8.1): esse campo so e gravado em
+AMDHWVMM::setMemoryAllocationsEnabled(true), alcancado apenas por
+AMDGraphicsAccelerator::powerUpHW (be3e0c6), que tambem liga e inicia os motores
+(powerUpHWEngines, startHWEngines), habilita as alocacoes de memoria e o GART.
+powerUpHW so roda com a mensagem 6 ao acelerador (callPlatformFunction, be41768),
+enviada por AmdRadeonController::powerUp (c0197cf-c0197e9:
+messageAccelerator(6, &zero, 0, 0)), cujo unico chamador e
+AmdRadeonFramebuffer::enableController, que o 4a recusa.
+
+A recusa passa a mandar essa mensagem, uma vez, com os mesmos argumentos e no
+mesmo contexto, sem rodar o powerUp do controlador (sem PowerPlay, sem DAL).
+Registra antes e depois: acelerador, hardware, [hw+0x30f], [hw+0x319],
+[acc+0x1eb8], os campos +0x20/+0x28/+0x30 do VMM, o canal do pool e uma amostra
+s3 do chip. -rmbnomsg6 desliga. Sem -rmbfbstubs o comportamento e o do 0022.
+
+Segunda mensagem da Apple (achado do revisor): no enableController do ultimo
+framebuffer o powerUp manda messageAccelerator(0x1b, NULL, 0, 0)
+(c0194cc-c019504), caso be417d0 "Controller is enabled, finish initialization":
+startGlobalPerfCounters, hardwareDidStart e AMDHardware::enableInterrupts.
+Nao se sabe se a 610M aguenta as interrupcoes ligadas, entao ela nao e mandada
+na subida: uma thread manda uma vez quando a variavel de NVRAM rmb-msg1b
+aparece (sudo nvram rmb-msg1b=1, por SSH). Variavel ja presente na subida e
+ignorada o boot inteiro, para nao repetir a cada boot.
+
+Confirma: ">> AccelPowerUpHW", "<< Navi23HwPowerUp = ..01", "enableAllocations = 1",
+"<< AccelPowerUpHW = ..01", "4a: msg6 after: ... hw+30f 1 ... +28 set".
+Refuta: "hw+30f 1" antes (powerUpHW pula tudo), "<< AccelPowerUpHW = ..00",
+"+28 NULL" depois.
+Para: panico, perda de SSH, ">> CtrlPowerUp", RESTORE MISMATCH, "failed to
+route", "mmio: stage 3 dropped write" nesse caminho, GPU Restart ou espera
+longa nos motores.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/kern_start.cpp | 102 ++++++++++++++++++++++++++++++--
+ 1 file changed, 98 insertions(+), 4 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 850b8a9..30b2a2b 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -5,6 +5,7 @@
+ //  its event logger and prints what they return, to find where TTL init fails on the APU.
+ //
+ 
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <Headers/plugin_start.hpp>
+ #include <Headers/kern_api.hpp>
+ #include <IOKit/IOLib.h>
+@@ -191,10 +192,98 @@ static bool gFbStagedOk;
+ // Sub-stage 4a: AmdRadeonFramebuffer::enableController fails without running Apple's code, so the
+ // DAL (powerUp, mode set, DMCUB, PHY) never starts. IOFramebuffer::open still delivers the
+ // display-mode notifications around it, which is all the accelerator needs.
+-static uint64_t wrapFbEnableControllerRefused(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
++//
++// Patch 0024. Measured at the boot of 25/11 14:17 (patch 0023): the accelerator became enabled, and
++// the first Metal command panicked in AMDHWVMM::endVMPTUpdate()+0x13 with [vmm+0x28] NULL. That
++// field (the VM command buffer pool) is written only by AMDHWVMM::setMemoryAllocationsEnabled(true),
++// reached only from AMDGraphicsAccelerator::powerUpHW (be3e0c6), which also powers up and starts
++// the hardware engines and enables memory allocations. powerUpHW runs only on accelerator message
++// 6, which AmdRadeonController::powerUp sends (c0197cf-c0197e9: messageAccelerator(6, &zero, 0, 0))
++// and whose only caller is this enableController. So the refusal sends that one message itself,
++// once, in the same context Apple sends it, and still does not run powerUp (no PowerPlay, no DAL).
++// -rmbnomsg6: don't.
++static void s3Sample(const char *when);  // stage 3 measurement, defined below
++// What the two accelerator messages change. messageAccelerator: accelerator at [ctrl+0x7960];
++// powerUpHW: hardware at [acc+0x1a38], skips everything when [hw+0x30f] is already set;
++// AMDHardware::setMemoryAllocationsEnabled: VMM at [hw+0x380]; the VM pool's channel is
++// acc[0x1a78 + 8 * [acc+0x1e7c]] (be8444c); AMDHardware::enableInterrupts sets [hw+0x319] (bea9558).
++static void accelState4a(uint64_t ctrl, const char *what, const char *when) {
++	auto rq = [](uint64_t p, uint32_t o) { return p ? *reinterpret_cast<const volatile uint64_t *>(p + o) : 0ULL; };
++	auto rb = [](uint64_t p, uint32_t o) { return p ? uint32_t(*reinterpret_cast<const volatile uint8_t *>(p + o)) : 0xffU; };
++	uint64_t acc = rq(ctrl, 0x7960), hw = rq(acc, 0x1a38), vmm = rq(hw, 0x380);
++	uint32_t idx = acc ? *reinterpret_cast<const volatile uint32_t *>(acc + 0x1e7c) : 0;
++	LOG("4a: %s %s: accel %s hw %s hw+30f %u hw+319 %u accel+1eb8 %u accel flags %x; vmm %s +20 %s +28 %s +30 %s; channel[%u] %s", what, when,
++	    acc ? "set" : "NULL", hw ? "set" : "NULL", rb(hw, 0x30f), rb(hw, 0x319), rb(acc, 0x1eb8),
++	    acc ? *reinterpret_cast<const volatile uint32_t *>(acc + 0xc78) : 0, vmm ? "set" : "NULL",
++	    rq(vmm, 0x20) ? "set" : "NULL", rq(vmm, 0x28) ? "set" : "NULL", rq(vmm, 0x30) ? "set" : "NULL", idx,
++	    idx >= 16 ? "index out of range, not read" : rq(acc, 0x1a78 + 8 * idx) ? "set" : "NULL");
++}
++static uint64_t gCtrl4a;
++static uint64_t wrapFbEnableControllerRefused(uint64_t fb, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
++	static bool sent;
++	uint64_t ctrl = fb ? *reinterpret_cast<uint64_t *>(fb + 0x8a40) : 0;  // enableController: [fb+0x8a40]->powerUp (bfe0acc)
++	if (ctrl)
++		gCtrl4a = ctrl;
++	if (!sent && ctrl && orgMessageAccelerator && orgDoesAcceleratorExist && !checkKernelArgument("-rmbnomsg6")) {
++		sent = true;
++		accelState4a(ctrl, "msg6", "before");
++		s3Sample("before msg6");
++		uint32_t zero = 0;
++		auto r = wrapMessageAccelerator(reinterpret_cast<void *>(ctrl), 6, reinterpret_cast<uint64_t>(&zero), 0, 0, 0);
++		LOG("4a: msg6 sent, messageAccelerator(6) = %llx (lo32 %llx)", r, r & 0xFFFFFFFF);
++		accelState4a(ctrl, "msg6", "after");
++		s3Sample("after msg6");
++	}
+ 	LOG("4a: AmdRadeonFramebuffer::enableController refused (kIOReturnUnsupported), Apple's DAL not run");
+ 	return 0xe00002c7;
+ }
++// Apple's powerUp sends a second message: on the enableController of the last framebuffer
++// (c0194cc-c019504) messageAccelerator(0x1b, NULL, 0, 0), "Controller is enabled, finish
++// initialization" (be417d0): startGlobalPerfCounters, hardwareDidStart and
++// AMDHardware::enableInterrupts. Not known yet whether the 610M survives its interrupts being
++// turned on, so it is not sent during boot: this thread sends it once, when the NVRAM variable
++// rmb-msg1b appears (sudo nvram rmb-msg1b=1, from SSH). A variable already there when the thread
++// starts is ignored for the whole boot, so a forgotten one can never repeat this at every boot.
++// The case takes the accelerator's own locks, like case 6; it does not need the framebuffer gates.
++static void msg1bThread(void *, wait_result_t) {
++	auto present = []() {
++		auto opts = IORegistryEntry::fromPath("/options", gIODTPlane);
++		auto p = opts ? opts->copyProperty("rmb-msg1b") : nullptr;
++		bool r = p != nullptr;
++		OSSafeReleaseNULL(p);
++		OSSafeReleaseNULL(opts);
++		return r;
++	};
++	// No /options yet: a forgotten variable could not be told from a new request later, so don't arm.
++	auto opts = IORegistryEntry::fromPath("/options", gIODTPlane);
++	if (!opts) {
++		LOG("4a: msg1b: /options not published yet, not armed for this boot");
++		return;
++	}
++	opts->release();
++	if (present()) {
++		LOG("4a: msg1b: NVRAM variable rmb-msg1b already present at boot: ignored for this whole boot (sudo nvram -d rmb-msg1b)");
++		return;
++	}
++	LOG("4a: msg1b: armed for 4 h: sudo nvram rmb-msg1b=1 sends accelerator message 0x1b once (interrupts on)");
++	for (uint32_t i = 0; i < 4 * 3600 && !present(); i++)
++		IOSleep(1000);
++	if (!present()) {
++		LOG("4a: msg1b: not requested within 4 h, thread done");
++		return;
++	}
++	uint64_t ctrl = gCtrl4a;
++	if (!ctrl || !orgMessageAccelerator || !orgDoesAcceleratorExist) {
++		LOG("4a: msg1b: requested, but no controller seen by enableController or messageAccelerator not hooked: not sent");
++		return;
++	}
++	accelState4a(ctrl, "msg1b", "before");
++	s3Sample("before msg1b");
++	auto r = wrapMessageAccelerator(reinterpret_cast<void *>(ctrl), 0x1b, 0, 0, 0, 0);
++	LOG("4a: msg1b sent, messageAccelerator(0x1b) = %llx (lo32 %llx)", r, r & 0xFFFFFFFF);
++	accelState4a(ctrl, "msg1b", "after");
++	s3Sample("after msg1b");
++}
+ // Stage 2 / 3 fallback, used only when the headless routes or write-blocking register hooks could not all be installed.
+ static uint64_t wrapCtrlStartDeclined(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+ 	LOG("stage %u: AmdRadeonController start declined (headless or register hooks missing)", rmbStage());
+@@ -509,8 +598,12 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 		gFbStagedOk = s2WritesBlocked;
+ 		LOG("4a: framebuffer stubs kept (-rmbfbstubs); 6 write-dropping register hooks %s; enableController will be refused",
+ 		    s2WritesBlocked ? "installed" : "MISSING: controller start will be declined");
+-		if (s2WritesBlocked)
++		if (s2WritesBlocked) {
+ 			displayStage4aOpen(patcher, index, address, size);
++			thread_t t;
++			if (kernel_thread_start(msg1bThread, nullptr, &t) == KERN_SUCCESS)
++				thread_deallocate(t);
++		}
+ 	}
+ 	if (gHeadless) {
+ 		KernelPatcher::RouteRequest fbReq {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer5startEP9IOService", wrapFbStart};
+@@ -1006,13 +1099,14 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0023, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s",
++	LOG("stage 3: kext patch 0024, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+ 	    checkKernelArgument("-rmbgpuclean") ? "by GPU DMA (-rmbgpuclean)" : "by CPU",
+ 	    checkKernelArgument("-rmbutcl2harvest") ? "programmed (-rmbutcl2harvest)" : "not programmed",
+-	    checkKernelArgument("-rmbfbstubs") ? "stubs kept, enableController refused (-rmbfbstubs, 4a)" : "none (headless)");
++	    checkKernelArgument("-rmbfbstubs") ? "stubs kept, enableController refused (-rmbfbstubs, 4a)" : "none (headless)",
++	    !checkKernelArgument("-rmbfbstubs") ? "not sent (no framebuffers)" : checkKernelArgument("-rmbnomsg6") ? "not sent (-rmbnomsg6)" : "sent at the first enableController; message 0x1b on NVRAM rmb-msg1b");
+ 	smuStage3BeforeHwInit();
+ 	s3Sample("before ttl_hw_init");
+ 	LOG(">> ttl_hw_init(%llx, %llx)", a, b);
+-- 
+2.39.5 (Apple Git-154)
+

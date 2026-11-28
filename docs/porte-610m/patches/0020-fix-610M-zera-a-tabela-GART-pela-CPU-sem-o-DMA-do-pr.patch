@@ -1,0 +1,135 @@
+From aa7a64c8a9ffb3fd3c9288afa6adb53cb2127782 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 18:54:09 -0800
+Subject: [PATCH 20/48] fix: 610M zera a tabela GART pela CPU, sem o DMA do
+ processador de comandos
+
+Causa medida no boot de 24/11 18:26 (kext patch 0019):
+_vm_clean_primary_page_table zera o primeiro pedaco da tabela GART pela CPU e
+preenche o resto dobrando com o DMA do processador de comandos
+(_gvm_cgs_gpu_memory_copy -> _vm_10_1_cp_dma_copy). Isso roda dentro de
+_vm_10_1_create_primary_page_table, ANTES de _vm_10_1_initialize_gart_registers:
+contexto 0 desligado (GCVM_CONTEXT0_CNTL 7ffe80) e base da tabela em zero.
+Na 610M o DMA nunca termina: CP_STAT vai de 0 para 80404000 (CP_BUSY |
+DMA_BUSY | UTCL2IU_BUSY), a espera de 50 ms em _gc_10_1_is_cp_dma_idle
+estoura, o HWLibs termina a limpeza pela CPU sozinho, e o processador de
+comandos fica ocupado ate o fim. Por isso o autoload do RLC nunca conclui
+(evento 0xc0100206): o Linux exige CP_STAT == 0.
+
+Correcao: enquanto _vm_clean_primary_page_table roda, [gvm]+0xe70 fica em 1,
+o que faz a propria funcao da Apple zerar tudo pela CPU (ramo +0x7f/+0xbe);
+o valor e devolvido ao sair. O Linux v6.12 tambem escreve a tabela GART pela
+CPU (amdgpu_gmc_set_pte_pde) e nunca usa CP DMA aqui. Chave: -rmbgpuclean
+devolve o preenchimento por DMA.
+
+Confirma: some "s3 wait: callback +34d54"; "s3 before psp_hw_init" mostra
+CP_STAT 0 e GRBM 3028; "late wait" mostra CP_STAT==0 e BOOTLOAD_COMPLETE.
+Refuta: CP_STAT diferente de 0 antes do psp_hw_init mesmo sem a espera.
+Para: panico, perda de SSH, RESTORE MISMATCH ou "failed to route".
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSq6qhPCpgUwz1z7gpv
+---
+ src/RembrandtGfx/kern_start.cpp | 63 +++++++++++++++++++++++++++++++--
+ 1 file changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index d779bf5..9faa92f 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -968,10 +968,11 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0019, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s",
++	LOG("stage 3: kext patch 0020, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+-	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped");
++	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
++	    checkKernelArgument("-rmbgpuclean") ? "by GPU DMA (-rmbgpuclean)" : "by CPU");
+ 	smuStage3BeforeHwInit();
+ 	s3Sample("before ttl_hw_init");
+ 	LOG(">> ttl_hw_init(%llx, %llx)", a, b);
+@@ -1058,6 +1059,61 @@ static uint64_t wrap_gc_golden_settings_execution(uint64_t a, uint64_t b, uint64
+ 	return r;
+ }
+ 
++// (d) patch 0020. _vm_10_1_init_gart_pt runs _vm_10_1_create_primary_page_table, which calls
++// _vm_clean_primary_page_table to zero the new GART table, and only afterwards programs the GART
++// registers and enables context 0. The clean zeroes the first chunk with the CPU and fills the
++// rest by doubling it with the command processor's DMA engine (_gvm_cgs_gpu_memory_copy ->
++// _vm_10_1_cp_dma_copy), unless [gvm]+0xe70 == 1, in which case it zeroes everything with the CPU.
++// Measured on the 610M (boot of 24/11 18:26): with context 0 still off (GCVM_CONTEXT0_CNTL 7ffe80,
++// page table base 0) that DMA never ends. CP_STAT goes from 0 to 80404000 (CP_BUSY | DMA_BUSY |
++// UTCL2IU_BUSY), the 50 ms wait on _gc_10_1_is_cp_dma_idle times out, HWLibs falls back to the CPU
++// clear by itself, and the command processor stays busy for good, so the RLC autoload can never
++// complete (Linux needs CP_STAT == 0). Linux v6.12 never uses CP DMA here: it writes the GART table
++// with the CPU (amdgpu_gmc_set_pte_pde). This memory is CPU-visible on UMA, so take HWLibs' own CPU
++// path from the start: hold [gvm]+0xe70 at 1 for the duration of the clean only, then restore it.
++// -rmbgpuclean: leave Apple's DMA fill.
++static mach_vm_address_t org_vm_clean_primary_page_table;
++static uint64_t wrap_vm_clean_primary_page_table(uint64_t vm, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	uint64_t gvm = vm ? *reinterpret_cast<const uint64_t *>(vm) : 0;
++	// Only while GC VM context 0 is still off (GCVM_CONTEXT0_CNTL bit 0 clear): that is the state
++	// in which the DMA fill hangs. With the context on, Apple's path is left alone.
++	uint32_t ctx0 = mmioAvailable() ? mmioRead(0x1260 + 0x15fc) : 1;
++	if (!gvm || gcHwVersion() != 0xa0307 || (ctx0 & 1) || checkKernelArgument("-rmbgpuclean")) {
++		LOG("s3 clean_pt: Apple's DMA fill left alone (ctx0 cntl %x)", ctx0);
++		s3Sample("before clean_pt (Apple's DMA fill)");
++		auto r = reinterpret_cast<Fn6>(org_vm_clean_primary_page_table)(vm, b, c, d, e, f);
++		s3Sample("after clean_pt (Apple's DMA fill)");
++		return r;
++	}
++	auto e70 = reinterpret_cast<uint32_t *>(gvm + 0xe70);
++	uint32_t old = *e70;
++	uint64_t mc = *reinterpret_cast<const uint64_t *>(vm + 0x168);
++	uint64_t cpu = *reinterpret_cast<const uint64_t *>(vm + 0x178);
++	uint64_t first = *reinterpret_cast<const uint32_t *>(vm + 0x148);
++	uint64_t rest = *reinterpret_cast<const uint64_t *>(vm + 0x190) & 0xFFFFFFFFu;  // HWLibs uses 32 bits of it
++	LOG("s3 clean_pt: [gvm]+0xe70 %u -> 1 for this call; ctx0 cntl %x; table cpu ptr %s (low %08x), mc %x_%08x, first %#llx + rest %#llx = %#llx bytes",
++	    old, ctx0, cpu ? "set" : "NULL", static_cast<uint32_t>(cpu), static_cast<uint32_t>(mc >> 32),
++	    static_cast<uint32_t>(mc), first, rest, first + rest);
++	s3Sample("before clean_pt");
++	*e70 = 1;
++	auto r = reinterpret_cast<Fn6>(org_vm_clean_primary_page_table)(vm, b, c, d, e, f);
++	*e70 = old;
++	// The zeroes must have left the CPU before _vm_10_1_initialize_gart_registers turns context 0 on.
++	// HWLibs only invalidates the HDP read cache here (_gvm_invalidate_flush {8, 2}); it does not flush
++	// the CPU side. Linux does mb() after its CPU writes (amdgpu_gart.c). clflush is harmless on an
++	// uncached or write-combining mapping and covers the cached case. Sanity bound: 16 MB.
++	if (cpu && first + rest <= 0x1000000) {
++		for (uint64_t p = cpu & ~63ull; p < cpu + first + rest; p += 64)
++			asm volatile("clflush (%0)" : : "r"(p) : "memory");
++		asm volatile("mfence" : : : "memory");
++		LOG("s3 clean_pt: CPU cache flushed over %#llx bytes", first + rest);
++	} else {
++		LOG("s3 clean_pt: CPU cache flush skipped (cpu ptr %s, size %#llx)", cpu ? "set" : "NULL", first + rest);
++	}
++	s3Sample("after clean_pt");
++	return r;
++}
++
+ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	bool s2 = rmbStage() == 2, s3 = rmbStage() == 3;
+ 	KernelPatcher::RouteRequest requests[] {
+@@ -1149,6 +1205,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 			{"_psp_asd_unload", wrap_psp_asd_unload, org_psp_asd_unload},
+ 			{"_gc_check_grbm_cam_remap_10_3", wrap_gc_check_grbm_cam_remap_10_3, org_gc_check_grbm_cam_remap_10_3},
+ 			{"_gc_golden_settings_execution", wrap_gc_golden_settings_execution, org_gc_golden_settings_execution},
++			{"_vm_clean_primary_page_table", wrap_vm_clean_primary_page_table, org_vm_clean_primary_page_table},
+ 		};
+ 		unsigned routed = 0;
+ 		for (auto &r : diag) {
+@@ -1158,7 +1215,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 				LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
+ 			patcher.clearError();
+ 		}
+-		LOG("stage 3: %u of 7 stage-3 hooks installed (3 measurement, 4 fixes: asd load, asd unload, cam, golden)", routed);
++		LOG("stage 3: %u of 8 stage-3 hooks installed (3 measurement, 5 fixes: asd load, asd unload, cam, golden, gart clean)", routed);
+ 		LOG("stage 3: ttl_hw_init runs only if the preflight passes; wake POST hooks not installed");
+ 	}
+ 	LOG("HWLibs hooks installed");
+-- 
+2.39.5 (Apple Git-154)
+

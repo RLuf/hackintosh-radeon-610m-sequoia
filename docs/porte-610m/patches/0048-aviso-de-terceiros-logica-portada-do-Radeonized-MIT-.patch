@@ -1,0 +1,48 @@
+From ac27e315463c3f5d3224d9a98580cee27ce3deb4 Mon Sep 17 00:00:00 2001
+From: fzmac <fzmac@localhost>
+Date: Thu, 26 Nov 2026 23:43:38 -0300
+Subject: [PATCH 48/48] aviso de terceiros: logica portada do Radeonized (MIT)
+ junto de buildV2; so comentario, sem mudanca de codigo
+
+Co-authored-by: opus-fable
+---
+ src/RembrandtGfx/display.cpp | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index e6dff76..94ee92c 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -3973,6 +3973,29 @@ IOReturn agdcExtCap(void *agdc, uint8_t *req, size_t size) {
+ // and src/common/rb_otg.h rb_otg_to_v2): link id 0xFFFFFFFF, flags 0x08|0x02 (no link; bit 0 clear,
+ // so 0x925/0x988 are not asked), stream +0xa4 = 0, state +0xac = 0x80000000.
+ // Totals follow Linux's optc programming (register = total - 1), as gMode.htot/vtot already do.
++//
++// Third-party notice. buildV2() below is a rewrite of rb_otg_to_v2() and the 0x921 reply follows
++// rb_agdc_link_config() from Radeonized (https://github.com/FranciumOS-org/Radeonized, commit
++// a5399fe1, src/common/rb_otg.h and src/common/rb_agdc.h). The fb 0 scaler entry (0x711), the
++// per-tick read of flip+8 and the linear display surfaces (probe.cpp) follow findings of the same
++// project. Radeonized is distributed under the MIT License:
++//
++//   Copyright (c) 2026 RembrandtGPU contributors
++//
++//   Permission is hereby granted, free of charge, to any person obtaining a copy of this software
++//   and associated documentation files (the "Software"), to deal in the Software without
++//   restriction, including without limitation the rights to use, copy, modify, merge, publish,
++//   distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
++//   Software is furnished to do so, subject to the following conditions:
++//
++//   The above copyright notice and this permission notice shall be included in all copies or
++//   substantial portions of the Software.
++//
++//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
++//   BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++//   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
++//   DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++//   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ uint8_t gV2[0xa0];
+ int gV2Err = -1;  // 0 ok; >0 which check failed (logged)
+ int buildV2(const Mode &m) {
+-- 
+2.39.5 (Apple Git-154)
+

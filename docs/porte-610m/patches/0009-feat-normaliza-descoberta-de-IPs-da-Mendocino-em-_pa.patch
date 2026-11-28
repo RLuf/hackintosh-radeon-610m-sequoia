@@ -1,0 +1,145 @@
+From 03f594693a2c19326144a53af91b5da31dd96020 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 04:05:54 -0800
+Subject: [PATCH 09/48] feat: normaliza descoberta de IPs da Mendocino em
+ _parse_ip_discovery_v2_tbl e liga fw SDMA
+
+---
+ src/RembrandtGfx/firmware.cpp   | 20 ++++++++++---
+ src/RembrandtGfx/kern_start.cpp | 51 +++++++++++++++++++++++++++++++--
+ 2 files changed, 64 insertions(+), 7 deletions(-)
+
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index 9db1dc3..7ade9d9 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -214,6 +214,7 @@ uint64_t wrapDcn31FwConstraint(uint64_t ver, uint64_t dmcub, uint64_t list, uint
+ 
+ bool gFwHooksOk;     // the PSP hooks of this stage are in place
+ size_t gFwSubsDone;  // GC descriptors pointed at the embedded images (11 = all)
++bool gSdmaSubDone;   // SDMA descriptor pointed at the embedded image
+ 
+ }  // namespace
+ 
+@@ -222,10 +223,10 @@ size_t gFwSubsDone;  // GC descriptors pointed at the embedded images (11 = all)
+ bool firmwareReady(const char *set) {
+ 	size_t n = strlen(set);
+ 	bool right = !strncmp(fw_apu_manifest, "set=", 4) && !strncmp(fw_apu_manifest + 4, set, n) && fw_apu_manifest[4 + n] == ' ';
+-	if (!right || !gFwHooksOk || gFwSubsDone != 11 || !FW_SIZE(toc))
+-		LOG("fw: not ready: want set %s, hooks %d, descriptors %zu of 11, TOC %#x bytes; embedded: %.60s", set, gFwHooksOk,
+-		    gFwSubsDone, FW_SIZE(toc), fw_apu_manifest);
+-	return right && gFwHooksOk && gFwSubsDone == 11 && FW_SIZE(toc);
++	if (!right || !gFwHooksOk || gFwSubsDone != 11 || !gSdmaSubDone || !FW_SIZE(toc) || !FW_SIZE(sdma))
++		LOG("fw: not ready: want set %s, hooks %d, descriptors %zu of 11, sdma %d (%#x B), TOC %#x bytes; embedded: %.60s", set,
++		    gFwHooksOk, gFwSubsDone, gSdmaSubDone, FW_SIZE(sdma), FW_SIZE(toc), fw_apu_manifest);
++	return right && gFwHooksOk && gFwSubsDone == 11 && gSdmaSubDone && FW_SIZE(toc) && FW_SIZE(sdma);
+ }
+ 
+ void firmwareRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+@@ -282,4 +283,15 @@ void firmwareRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t addre
+ 		gFwSubsDone++;
+ 		LOG("fw: %s %#x -> %#x bytes", s.symbol + 11, oldSize, s.size);
+ 	}
++	if (auto sdmaDesc = patcher.solveSymbol<uint8_t *>(index, "_sdma_5_2_3_ucode", address, size)) {
++		auto oldSize = *reinterpret_cast<uint32_t *>(sdmaDesc + 0x08);
++		*reinterpret_cast<const char **>(sdmaDesc + 0x00) = "9";
++		*reinterpret_cast<uint32_t *>(sdmaDesc + 0x08) = FW_SIZE(sdma);
++		*reinterpret_cast<const uint8_t **>(sdmaDesc + 0x10) = fw_apu_sdma;
++		gSdmaSubDone = true;
++		LOG("fw: sdma_5_2_3_ucode %#x -> %#x bytes", oldSize, FW_SIZE(sdma));
++	} else {
++		LOG("fw: _sdma_5_2_3_ucode not found");
++	}
++	patcher.clearError();
+ }
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 986c221..1f7eda5 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -547,6 +547,50 @@ static uint64_t wrap_pcie_ip_sw_init(uint64_t, uint64_t, uint64_t, uint64_t, uin
+ 	return 0;
+ }
+ 
++// Mendocino IP discovery revisions that fall outside HWLibs 15.8.1's lookup tables are normalized
++// right after _parse_ip_discovery_v2_tbl populates ipconfig (19 slots of 0x260 bytes at +0x20),
++// so BGM, GVM (both init and exit), SDMA, MES and DMCUB see compatible Rembrandt revisions.
++// The real GC version (0xa0307) is preserved in gRealGcVersion for golden.cpp and stage3Preflight.
++static uint32_t gRealGcVersion;
++static mach_vm_address_t org_parse_ip_discovery_v2_tbl;
++static uint64_t wrap_parse_ip_discovery_v2_tbl(uint64_t ipcfg, uint64_t tbl, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	auto r = reinterpret_cast<Fn6>(org_parse_ip_discovery_v2_tbl)(ipcfg, tbl, c, d, e, f);
++	if ((r & 0xFFFFFFFF) == 0 && ipcfg) {
++		uint32_t nslots = *reinterpret_cast<const uint32_t *>(ipcfg + 0x1c);
++		if (nslots > 32)
++			nslots = 32;
++		for (uint32_t slot = 0; slot < nslots; slot++) {
++			auto entry = reinterpret_cast<uint8_t *>(ipcfg + 0x20 + slot * 0x260);
++			uint32_t bt = *reinterpret_cast<const uint32_t *>(entry + 0x00);
++			uint32_t ninst = *reinterpret_cast<const uint32_t *>(entry + 0x04);
++			if (ninst > 10)
++				ninst = 10;
++			for (uint32_t inst = 0; inst < ninst; inst++) {
++				auto v = reinterpret_cast<uint32_t *>(entry + 0x08 + inst * 0x3c);
++				uint32_t maj = v[0] & 0xFFFF, min = v[1] & 0xFFFF, rev = v[2] & 0xFFFF, newRev = rev;
++				if (bt == 61 && maj == 6 && min == 0 && rev == 1)
++					newRev = 0;  // PCIE 6.0.1 -> 6.0.0
++				else if (bt == 7 && maj == 13 && min == 0 && rev == 9)
++					newRev = 1;  // SMUIO 13.0.9 -> 13.0.1 (Rembrandt APU line)
++				else if (bt == 70 && maj == 10 && min == 0 && rev == 1)
++					newRev = 0;  // UMC 10.0.1 -> 10.0.0
++				else if (bt == 11 && maj == 10 && min == 3 && rev == 7) {
++					gRealGcVersion = (maj << 16) | (min << 8) | rev;
++					newRev = 3;  // GC 10.3.7 -> 10.3.3 (GVM vm_10_3_3 & MES < 10.3.6)
++				} else if (bt == 35 && maj == 5 && min == 2 && rev == 7)
++					newRev = 3;  // SDMA 5.2.7 -> 5.2.3
++				else if (bt == 16 && maj == 3 && min == 1 && rev == 6)
++					newRev = 2;  // DMU/DCN 3.1.6 -> 3.1.2
++				if (newRev != rev) {
++					v[2] = (v[2] & ~0xFFFFu) | newRev;
++					LOG("ipdisc-norm: bt %u/%u %u.%u.%u -> %u.%u.%u", bt, inst, maj, min, rev, maj, min, newRev);
++				}
++			}
++		}
++	}
++	return r;
++}
++
+ // DeviceCapabilityTbl is keyed by (device id, internal revision, external/PCI revision). All
+ // Navi 23 (0x73FF) rows have internal revision 0; Rembrandt reports its own, so no row matches.
+ // Look up the Navi 23 row with internal revision 0 and the real PCI revision.
+@@ -554,7 +598,7 @@ static mach_vm_address_t org_ttlSetDeviceCapabilityEntry;
+ // What HWLibs' software init showed at this boot, for the stage 3 preflight (-1 / 0 = not seen).
+ static int64_t gSawCapEntry = -1, gSawPspInit = -1;
+ static uint32_t gSawPspMajor, gSawGcVersion;
+-uint32_t gcHwVersion() { return gSawGcVersion; }
++uint32_t gcHwVersion() { return gRealGcVersion ? gRealGcVersion : gSawGcVersion; }
+ static uint64_t wrap_ttlSetDeviceCapabilityEntry(uint64_t ctx, uint64_t dev, uint64_t intRev, uint64_t extRev, uint64_t e, uint64_t f) {
+ 	LOG("ttlSetDeviceCapabilityEntry(dev %llx, internal rev %llx, external rev %llx) -> using internal rev 0",
+ 		dev & 0xFFFFFFFF, intRev & 0xFFFFFFFF, extRev & 0xFFFFFFFF);
+@@ -772,13 +816,13 @@ static bool stage3Preflight() {
+ 		{"register aperture mapped (BAR 5 is 512 KB)", mmioAvailable()},
+ 		{"capability row found (ttlSetDeviceCapabilityEntry = 1)", gSawCapEntry == 1},
+ 		{"PSP type set (MP0 major 13, psp_asic_type_init = 0)", gSawPspMajor == 13 && gSawPspInit == 0},
+-		{"HWLibs read GC 10.3.7 (a0307)", gSawGcVersion == 0xa0307},
++		{"HWLibs parsed GC 10.3.7 -> 10.3.3 -> 10.3.4", gcHwVersion() == 0xa0307 && (gSawGcVersion == 0xa0303 || gSawGcVersion == 0xa0307)},
+ 		{"PMFW answered GetSmuVersion", smuPmfwOk()},
+ 		{"discovery table: GC 10.3.7, bases 0x1260 / 0xA000", ipDiscIs(11, 10, 3, 7, 0x1260, 0xA000)},
+ 		{"discovery table: MP0 13.0.8, base 0x16000", ipDiscIs(255, 13, 0, 8, 0x16000, ~0u)},
+ 		{"discovery table: MP1 13.0.8, base 0x16000", ipDiscIs(1, 13, 0, 8, 0x16000, ~0u)},
+ 		{"discovery table: SDMA0 5.2.7, base 0x1260", ipDiscIs(42, 5, 2, 7, 0x1260, ~0u)},
+-		{"firmware: mendocino set, 11 GC descriptors and the PSP hooks in place", firmwareReady("mendocino")},
++		{"firmware: mendocino set, 11 GC + 1 SDMA descriptors and the PSP hooks in place", firmwareReady("mendocino")},
+ 		{"framebuffer: headless, 6 write-dropping register hooks", gFbStagedOk},
+ 	};
+ 	bool all = true;
+@@ -866,6 +910,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 		{"_vbs_hw_init", wrap_vbs_hw_init, org_vbs_hw_init},
+ 		{"_psp_power_up_event", wrap_psp_power_up_event, org_psp_power_up_event},
+ 		{"_pcie_ip_sw_init", wrap_pcie_ip_sw_init},
++		{"_parse_ip_discovery_v2_tbl", wrap_parse_ip_discovery_v2_tbl, org_parse_ip_discovery_v2_tbl},
+ 		{"_PEM_ExcuteEventChain", wrap_PEM_ExcuteEventChain},
+ 		{"_Phw_CommonDynamicState_ApplyClocksAdjustRules", wrap_ApplyClocksAdjustRules},
+ 		{"_get_hw_revision", wrap_get_hw_revision, org_get_hw_revision},
+-- 
+2.39.5 (Apple Git-154)
+

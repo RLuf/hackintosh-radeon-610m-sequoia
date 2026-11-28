@@ -1,0 +1,618 @@
+From b7dbc521eaaf4f95cc8ad00113ae1874126c3f5e Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Wed, 25 Nov 2026 22:32:58 -0300
+Subject: [PATCH 28/48] feat: -rmbgopfb faz os stubs de framebuffer servirem o
+ modo que o firmware deixou aceso
+
+Medido no boot de 25/11 22:26 com o 0027 (-rmbgopcensus): OTG0 ligado, 1366x768
+a 60 quadros/s; HUBP0 em ARGB8888 linear, viewport 1366x768, pitch 1408 px,
+endereco f4_00000000 (inicio do FB), igual nas tres leituras; console do
+firmware em 0x470000000 (inicio do BAR0, 256 MB), 5632 bytes por linha.
+
+Com -rmbgopfb (sem ele nada muda; precisa de rmbstage=3 -rmbfbstubs): 28
+virtuais do AmdRadeonFramebuffer roteados, enableController devolve sucesso nos
+tres framebuffers (o CoreDisplay exige todos abertos), fb0 com um modo (id 100,
+geometria do console), fb1/fb2 desligados. A abertura e a sub-faixa do BAR0 que
+contem o console. Interrupcoes 'vbl '/'fstr'/'txni' por temporizador; a
+transacao 'amtr' do acelerador e aceita, registrada e retirada no tique
+seguinte. Nenhum registrador e escrito; o DAL da Apple segue sem rodar. Se
+alguma rota faltar, o enableController continua recusando, como no 0027.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSnTLAbgqeuDELHd7ED
+---
+ src/RembrandtGfx/display.cpp    | 504 +++++++++++++++++++++++++++++++-
+ src/RembrandtGfx/kern_start.cpp |  11 +-
+ src/RembrandtGfx/rmb.hpp        |   4 +
+ 3 files changed, 517 insertions(+), 2 deletions(-)
+
+diff --git a/src/RembrandtGfx/display.cpp b/src/RembrandtGfx/display.cpp
+index 1e10b38..46b13a9 100644
+--- a/src/RembrandtGfx/display.cpp
++++ b/src/RembrandtGfx/display.cpp
+@@ -14,6 +14,8 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <kern/thread.h>
++#include <IOKit/IODeviceMemory.h>
++#include <IOKit/graphics/IOGraphicsTypes.h>
+ 
+ namespace {
+ 
+@@ -3326,6 +3328,505 @@ void displayGopCensus(const char *when) {
+ 	OSSafeReleaseNULL(fb0);
+ }
+ 
++// Patch 0028 (-rmbgopfb, opt-in; needs rmbstage=3 -rmbfbstubs): Apple's AmdRadeonFramebuffer stubs
++// serve the mode the firmware left lit on the eDP, without the DAL and without writing the DCN.
++// The IOGraphics side (IOGraphics-599 IOFramebuffer.cpp, the 15.8.1 kext is IOGraphicsFamily 599):
++// open() needs enableController() == 0 (:9119-9131), then registers 'vbl ' / 'dci ' / 'dpir'
++// interrupts (:9195, :9245, :9257), asks 'crsr' (:9268) and 'lddc' (:9282), and updateOnline()
++// asks 'cena' on connection 0 (:7770, online = error || value: offline needs SUCCESS with 0) and,
++// offline, looks for a mode whose appleTimingID is kIOTimingIDApple_0x0_0hz_Offline (:7799-7820).
++// postOpen -> initFB() needs getCurrentDisplayMode + getPixelInformation(kIOFBSystemAperture)
++// (:9685-9700) and skips the console init when either fails. CoreDisplay asserts unless EVERY
++// framebuffer it enumerates opens (CGXMappedDisplayStart, MappedDisplay.cpp:5491/5509, "Driver
++// Error: %ld of %ld framebuffers were successfully opened"), so fb 1 and fb 2 open too, offline.
++// The answers copy IONDRVSupport's IOBootNDRV (IONDRVFramebuffer.cpp:4382-4460, 4526-4600): one
++// mode, geometry and base from PE_Video, aperture = sub-range of the device memory holding the
++// console, appleTimingID 0 with Valid|Safe. The accelerator's display pipe (AMDRadeonX6000 15.8.1)
++// registers 'txni' / 'fstr' on the framebuffer (be497eb, be49874), hands each transaction to
++// setAttribute('amtr', pipe+0x410) (be4a5ed) and polls getAttribute('amtr') for completion
++// (be4a867): 'amtr' is accepted, logged and retired at the next timer tick; no HUBP write (0029).
++// Every routed virtual logs its first call per framebuffer. No register is written anywhere here.
++namespace gopfb {
++
++struct Mode {
++	bool ok;
++	uint32_t w, h, rowBytes, depth, hz, htot, vtot;
++	uint64_t consolePhys, hubpMc, fbBaseMc;
++};
++Mode gMode;
++bool gOn, gRouted;
++constexpr IODisplayModeID ModeLit = 100, ModeOffline = 200;  // 100 = IOBootNDRV's kIOBootNDRVDisplayMode
++
++// Framebuffer index from its location ("0".."2"), cached: 'amtr' arrives on the accelerator's
++// thread with its locks held, where a registry lookup (getLocation) is better avoided.
++void *gFbPtr[4];
++int fbIndex(void *fb) {
++	for (int i = 0; i < 4; i++)
++		if (fb && gFbPtr[i] == fb)
++			return i;
++	auto l = fb ? static_cast<IOService *>(fb)->getLocation() : nullptr;
++	int i = l && l[0] >= '0' && l[0] <= '3' && !l[1] ? l[0] - '0' : -1;
++	if (i >= 0)
++		gFbPtr[i] = fb;
++	return i;
++}
++
++// First call of each routed virtual, per framebuffer 0..3: the boot log shows the real order.
++void first(int what, const char *name, void *fb, uint64_t a = 0, uint64_t b = 0) {
++	static volatile uint32_t seen[40];
++	int i = fbIndex(fb);
++	uint32_t bit = 1u << (i < 0 || i > 3 ? 4 : i);
++	if (what < 0 || what >= 40 || (seen[what] & bit))
++		return;
++	seen[what] |= bit;
++	LOG("gopfb: first %s on fb%d (%llx, %llx)", name, i, a, b);
++}
++
++// Read once, before the first open (stage4aOpen) and again lazily if that did not run. Only reads.
++void sample(bool measureHz) {
++	constexpr uint32_t D = 0x34C0, G0 = 0x1260;
++	PE_Video v {};
++	bool pe = IOService::getPlatform() && IOService::getPlatform()->getConsoleInfo(&v) == kIOReturnSuccess;
++	Mode m {};
++	if (pe) {
++		m.consolePhys = v.v_baseAddr & ~3UL;
++		m.w = static_cast<uint32_t>(v.v_width), m.h = static_cast<uint32_t>(v.v_height);
++		m.rowBytes = static_cast<uint32_t>(v.v_rowBytes), m.depth = static_cast<uint32_t>(v.v_depth);
++	}
++	if (mmioAvailable()) {
++		uint32_t vp = mmioRead(D + 0x5ea), pitch = mmioRead(D + 0x607) & 0x3fff;
++		m.hubpMc = (static_cast<uint64_t>(mmioRead(D + 0x60b) & 0xffff) << 32) | mmioRead(D + 0x60a);
++		m.fbBaseMc = static_cast<uint64_t>(mmioRead(G0 + 0x16fc) & 0xFFFFFF) << 24;
++		m.htot = (mmioRead(D + 0x1b2a) & 0x7fff) + 1, m.vtot = (mmioRead(D + 0x1b2f) & 0x7fff) + 1;
++		LOG("gopfb: console %s phys %llx %ux%u rowBytes %u depth %u; HUBP0 viewport %ux%u pitch %u px addr %llx; FB base %llx; OTG0 total %ux%u",
++		    pe ? "ok" : "MISSING", m.consolePhys, m.w, m.h, m.rowBytes, m.depth, vp & 0x3fff, (vp >> 16) & 0x3fff, pitch + 1,
++		    m.hubpMc, m.fbBaseMc, m.htot, m.vtot);
++		if (!pe && (vp & 0x3fff)) {  // no console: fall back to the scanout registers
++			m.w = vp & 0x3fff, m.h = (vp >> 16) & 0x3fff, m.rowBytes = (pitch + 1) * 4, m.depth = 32;
++		}
++		if (measureHz && (mmioRead(D + 0x1b41) & 1)) {
++			uint32_t f0 = mmioRead(D + 0x1b4c) & 0xffffff;  // OTG0_OTG_STATUS_FRAME_COUNT, 24 bits
++			IOSleep(500);
++			m.hz = (((mmioRead(D + 0x1b4c) & 0xffffff) - f0) & 0xffffff) * 2;
++		}
++	}
++	if (m.hz < 20 || m.hz > 240)
++		m.hz = 60;  // logged below; the VBL timer only paces callbacks
++	m.ok = m.w && m.h && m.rowBytes >= m.w * 4 && (m.depth == 32 || m.depth == 24);
++	gMode = m;
++	LOG("gopfb: mode %s: %ux%u rowBytes %u %u Hz%s", m.ok ? "inherited" : "NOT usable (enableController keeps refusing)", m.w, m.h,
++	    m.rowBytes, m.hz, measureHz ? "" : " (not measured)");
++}
++
++// --- interrupts: 'vbl ' and 'fstr' fire every tick, 'txni' once per accepted 'amtr' transaction.
++struct Irq {
++	void *fb;
++	IOSelect type;
++	void (*proc)(OSObject *, void *);
++	OSObject *target;
++	void *ref;
++	volatile bool used, on;
++};
++Irq gIrq[24];
++struct TxnSnap {
++	volatile bool ready, logged;
++	int fb;
++	uint64_t addr, txn[6];
++	uint32_t flip[16];
++};
++TxnSnap gTxnSnap[4];
++IOSimpleLock *gIrqLock;
++volatile UInt32 gTxnPending[4];
++volatile SInt32 gTxnSeen;
++volatile uint32_t gTicks;
++
++void tickThread(void *, wait_result_t) {
++	for (;;) {
++		IOSleep(gMode.hz ? 1000 / gMode.hz : 16);
++		gTicks++;
++		uint32_t pend[4];
++		for (int i = 0; i < 4; i++)
++			pend[i] = gTxnPending[i] && OSCompareAndSwap(1, 0, &gTxnPending[i]);
++		for (auto &q : gIrq) {
++			if (!q.used || !q.on || !q.proc)
++				continue;
++			int i = fbIndex(q.fb);
++			bool fire = q.type == 'vbl ' || q.type == 'fstr' || (q.type == 'txni' && i >= 0 && i < 4 && pend[i]);
++			if (fire)
++				q.proc(q.target, q.ref);
++		}
++		for (uint32_t k = 0; k < 4; k++) {
++			auto &x = gTxnSnap[k];
++			if (!x.ready || x.logged)
++				continue;
++			x.logged = true;
++			LOG("gopfb: amtr #%u fb%d txn %llx: %llx %llx %llx %llx %llx %llx", k + 1, x.fb, x.addr, x.txn[0], x.txn[1], x.txn[2],
++			    x.txn[3], x.txn[4], x.txn[5]);
++			LOG("gopfb: amtr #%u flip: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", k + 1, x.flip[0],
++			    x.flip[1], x.flip[2], x.flip[3], x.flip[4], x.flip[5], x.flip[6], x.flip[7], x.flip[8], x.flip[9], x.flip[10], x.flip[11],
++			    x.flip[12], x.flip[13], x.flip[14], x.flip[15]);
++		}
++		if (gTicks == 600 || gTicks % 36000 == 0)
++			LOG("gopfb: tick %u, amtr transactions seen %u", gTicks, gTxnSeen);
++	}
++}
++
++// --- the routed virtuals (signatures from the 15.8.1 AMDRadeonX6000_AmdRadeonFramebuffer symbols)
++mach_vm_address_t gfbOrgGetAttr, gfbOrgSetAttr;
++
++// WindowServer may open the stubs before stage4aOpen samples (boot of 25/11 14:41: three opens at
++// 44.87 s, before the kext's own): sample here once if needed, inside the first enableController.
++IOReturn enable() {
++	static bool sampled;
++	if (gOn && gRouted && !gMode.ok && !sampled) {
++		sampled = true;
++		sample(true);
++	}
++	return gOn && gRouted && gMode.ok ? kIOReturnSuccess : kIOReturnUnsupported;
++}
++
++IOItemCount getDisplayModeCount(void *fb) {
++	first(0, "getDisplayModeCount", fb);
++	return 1;
++}
++IOReturn getDisplayModes(void *fb, IODisplayModeID *ids) {
++	first(1, "getDisplayModes", fb);
++	if (!ids)
++		return kIOReturnBadArgument;
++	*ids = fbIndex(fb) == 0 ? ModeLit : ModeOffline;
++	return kIOReturnSuccess;
++}
++IOReturn getInformationForDisplayMode(void *fb, IODisplayModeID mode, IODisplayModeInformation *info) {
++	first(2, "getInformationForDisplayMode", fb, static_cast<uint32_t>(mode));
++	if (!info)
++		return kIOReturnBadArgument;
++	bzero(info, sizeof(*info));
++	if (mode == ModeOffline)
++		return kIOReturnSuccess;  // 0x0, flags 0
++	if (mode != ModeLit)
++		return kIOReturnBadArgument;
++	info->nominalWidth = gMode.w;
++	info->nominalHeight = gMode.h;
++	info->refreshRate = gMode.hz << 16;
++	info->maxDepthIndex = 0;
++	info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag | kDisplayModeNativeFlag;
++	return kIOReturnSuccess;
++}
++UInt64 getPixelFormatsForDisplayMode(void *fb, IODisplayModeID, IOIndex) {
++	first(3, "getPixelFormatsForDisplayMode", fb);
++	return 0;  // deprecated; Apple's returns 0 too (c014af8)
++}
++const char *getPixelFormats(void *fb) {
++	first(4, "getPixelFormats", fb);
++	static const char formats[] = IO32BitDirectPixels "\0";
++	return formats;
++}
++IOReturn getPixelInformation(void *fb, IODisplayModeID mode, IOIndex depth, IOPixelAperture ap, IOPixelInformation *pi) {
++	first(5, "getPixelInformation", fb, static_cast<uint32_t>(mode), static_cast<uint32_t>(depth));
++	if (!pi || mode != ModeLit || depth != 0 || ap != kIOFBSystemAperture)
++		return kIOReturnUnsupportedMode;
++	bzero(pi, sizeof(*pi));
++	pi->bytesPerRow = gMode.rowBytes;
++	pi->bytesPerPlane = 0;
++	pi->bitsPerPixel = 32;
++	pi->pixelType = kIORGBDirectPixels;
++	pi->componentCount = 3;
++	pi->bitsPerComponent = 8;
++	pi->componentMasks[0] = 0x00ff0000, pi->componentMasks[1] = 0x0000ff00, pi->componentMasks[2] = 0x000000ff;
++	strlcpy(pi->pixelFormat, IO32BitDirectPixels, sizeof(pi->pixelFormat));
++	pi->flags = 0;
++	pi->activeWidth = gMode.w;
++	pi->activeHeight = gMode.h;
++	return kIOReturnSuccess;
++}
++IOReturn getCurrentDisplayMode(void *fb, IODisplayModeID *mode, IOIndex *depth) {
++	first(6, "getCurrentDisplayMode", fb);
++	if (fbIndex(fb) != 0)
++		return kIOReturnUnsupported;  // offline: initFB skips (IOFramebuffer.cpp:9694)
++	if (mode)
++		*mode = ModeLit;
++	if (depth)
++		*depth = 0;
++	return kIOReturnSuccess;
++}
++IOReturn getStartupDisplayMode(void *fb, IODisplayModeID *mode, IOIndex *depth) {
++	first(7, "getStartupDisplayMode", fb);
++	if (mode)
++		*mode = fbIndex(fb) == 0 ? ModeLit : ModeOffline;
++	if (depth)
++		*depth = 0;
++	return kIOReturnSuccess;
++}
++IOReturn setDisplayMode(void *fb, IODisplayModeID mode, IOIndex depth) {
++	first(8, "setDisplayMode", fb, static_cast<uint32_t>(mode), static_cast<uint32_t>(depth));
++	return (mode == ModeLit && depth == 0) || mode == ModeOffline ? kIOReturnSuccess : kIOReturnUnsupportedMode;
++}
++IOReturn setStartupDisplayMode(void *fb, IODisplayModeID mode, IOIndex) {
++	first(9, "setStartupDisplayMode", fb, static_cast<uint32_t>(mode));
++	return kIOReturnSuccess;  // nothing persisted
++}
++IOReturn getTimingInfoForDisplayMode(void *fb, IODisplayModeID mode, IOTimingInformation *t) {
++	first(10, "getTimingInfoForDisplayMode", fb, static_cast<uint32_t>(mode));
++	if (!t)
++		return kIOReturnBadArgument;
++	if (mode == ModeOffline) {
++		t->appleTimingID = kIOTimingIDApple_0x0_0hz_Offline;  // updateOnline's offline mode (:7815)
++		t->flags = 0;
++		return kIOReturnSuccess;
++	}
++	if (mode != ModeLit)
++		return kIOReturnBadArgument;
++	t->appleTimingID = 0;  // IOBootNDRV: csTimingData 0, no detailed timing (IONDRVFramebuffer.cpp:2432-2441, 4582)
++	t->flags = 0;
++	return kIOReturnSuccess;
++}
++IOReturn validateDetailedTiming(void *fb, void *, UInt64) {
++	first(11, "validateDetailedTiming", fb);
++	return kIOReturnUnsupported;
++}
++IOReturn setDetailedTimings(void *fb, OSArray *) {
++	first(12, "setDetailedTimings", fb);
++	return kIOReturnUnsupported;
++}
++IOReturn connectFlags(void *fb, IOIndex, IODisplayModeID mode, IOOptionBits *flags) {
++	first(13, "connectFlags", fb, static_cast<uint32_t>(mode));
++	if (flags)
++		*flags = mode == ModeLit ? kDisplayModeValidFlag | kDisplayModeSafeFlag : 0;
++	return kIOReturnSuccess;
++}
++IODeviceMemory *getApertureRange(void *fb, IOPixelAperture ap) {
++	first(14, "getApertureRange", fb, static_cast<uint32_t>(ap));
++	if (ap != kIOFBSystemAperture || fbIndex(fb) != 0 || !gMode.ok)
++		return nullptr;
++	// IOBootNDRV: the console's physical address inside one of the device's memory ranges.
++	auto dev = OSDynamicCast(IOService, static_cast<IOService *>(fb)->getProvider());
++	for (int up = 0; dev && up < 4; up++, dev = OSDynamicCast(IOService, dev->getProvider())) {
++		for (unsigned i = 0; i < dev->getDeviceMemoryCount(); i++) {
++			auto mem = dev->getDeviceMemoryWithIndex(i);
++			uint64_t pa = mem ? mem->getPhysicalAddress() : 0, len = mem ? mem->getLength() : 0;
++			uint64_t bytes = (static_cast<uint64_t>(gMode.rowBytes) * gMode.h + PAGE_MASK) & ~static_cast<uint64_t>(PAGE_MASK);
++			if (!mem || gMode.consolePhys < pa || gMode.consolePhys + bytes > pa + len)
++				continue;
++			static bool logged;
++			if (!logged) {
++				logged = true;
++				LOG("gopfb: aperture = %s memory %u (%llx + %llx) offset %llx length %llx; HUBP0 offset from FB base %llx",
++				    dev->getName(), i, pa, len, gMode.consolePhys - pa, bytes, gMode.hubpMc - gMode.fbBaseMc);
++			}
++			return IODeviceMemory::withSubRange(mem, gMode.consolePhys - pa, bytes);
++		}
++	}
++	LOG("gopfb: console %llx is in no device memory range of the framebuffer's providers", gMode.consolePhys);
++	return nullptr;
++}
++IOReturn getAttributeForConnection(void *fb, IOIndex conn, IOSelect sel, uintptr_t *value) {
++	first(15, "getAttributeForConnection", fb, sel);
++	static IOSelect logged[32];
++	static uint32_t n;
++	bool known = false;
++	for (uint32_t i = 0; i < n; i++)
++		known |= logged[i] == sel;
++	if (!known && n < 32) {
++		logged[n++] = sel;
++		LOG("gopfb: getAttributeForConnection(fb%d, %d, '%c%c%c%c')", fbIndex(fb), static_cast<int>(conn), (sel >> 24) & 0xff,
++		    (sel >> 16) & 0xff, (sel >> 8) & 0xff, sel & 0xff);
++	}
++	bool lit = fbIndex(fb) == 0;
++	switch (sel) {
++		case kConnectionEnable:
++		case kConnectionCheckEnable:
++			if (value)
++				*value = lit;  // offline must be SUCCESS with 0 (IOFramebuffer.cpp:7781)
++			return kIOReturnSuccess;
++		case kConnectionFlags:
++			if (value)
++				*value = lit ? kIOConnectionBuiltIn : 0;
++			return kIOReturnSuccess;
++		default:
++			return kIOReturnUnsupported;  // 'lddc', 'hddc', 'parm', ...: no DDC, no parameters
++	}
++}
++IOReturn setAttributeForConnection(void *fb, IOIndex, IOSelect sel, uintptr_t value) {
++	first(16, "setAttributeForConnection", fb, sel, value);
++	return kIOReturnSuccess;  // power, probe, sync: nothing to do on an inherited mode
++}
++bool hasDDCConnect(void *fb, IOIndex) {
++	first(17, "hasDDCConnect", fb);
++	return false;
++}
++IOReturn getDDCBlock(void *fb, IOIndex, UInt32, IOSelect, IOOptionBits, UInt8 *, IOByteCount *) {
++	first(18, "getDDCBlock", fb);
++	return kIOReturnUnsupported;
++}
++IOReturn getAppleSense(void *fb, IOIndex, UInt32 *, UInt32 *, UInt32 *, UInt32 *) {
++	first(19, "getAppleSense", fb);
++	return kIOReturnUnsupported;
++}
++IOReturn setGammaTable(void *fb, UInt32, UInt32, UInt32, void *, bool) {
++	first(20, "setGammaTable", fb);
++	return kIOReturnSuccess;
++}
++IOReturn setCursorImage(void *fb, void *) {
++	first(21, "setCursorImage", fb);
++	return kIOReturnUnsupported;
++}
++IOReturn setCursorState(void *fb, SInt32, SInt32, bool) {
++	first(22, "setCursorState", fb);
++	return kIOReturnUnsupported;
++}
++IOReturn getAttribute(void *fb, IOSelect sel, uintptr_t *value) {
++	first(23, "getAttribute", fb, sel);
++	if (sel == 'amtr')
++		return gTxnPending[fbIndex(fb) & 3] ? kIOReturnNotReady : kIOReturnSuccess;  // *value untouched, as Apple's
++	static IOSelect logged[32];
++	static uint32_t n;
++	bool known = false;
++	for (uint32_t i = 0; i < n; i++)
++		known |= logged[i] == sel;
++	if (!known && n < 32) {
++		logged[n++] = sel;
++		LOG("gopfb: getAttribute(fb%d, '%c%c%c%c') -> unsupported", fbIndex(fb), (sel >> 24) & 0xff, (sel >> 16) & 0xff,
++		    (sel >> 8) & 0xff, sel & 0xff);
++	}
++	return kIOReturnUnsupported;  // 'crsr' (no hardware cursor), 'vclt', ...
++}
++IOReturn setAttribute(void *fb, IOSelect sel, uintptr_t value) {
++	first(24, "setAttribute", fb, sel, value);
++	int i = fbIndex(fb);
++	if (sel == 'amtr') {
++		if (!value)
++			return kIOReturnBadArgument;
++		uint32_t n = OSIncrementAtomic(&gTxnSeen) + 1;
++		auto t = reinterpret_cast<const uint64_t *>(value);
++		if (n <= 4) {  // pipe+0x410: +0 flags (bit 0: +0x10 valid), +8 flag word, +0x10 flip state (be49dd2-be49e3f)
++			auto &snap = gTxnSnap[n - 1];  // copied here, printed by the tick thread (no log under the caller's locks)
++			memcpy(snap.txn, t, sizeof(snap.txn));
++			snap.fb = i, snap.addr = value;
++			if ((t[0] & 1) && t[2] >= 0xffffff8000000000ULL)
++				memcpy(snap.flip, reinterpret_cast<const void *>(t[2]), sizeof(snap.flip));
++			snap.ready = true;
++		}
++		if (i >= 0 && i < 4)
++			gTxnPending[i] = 1;  // retired by the next tick ('txni')
++		return kIOReturnSuccess;
++	}
++	static IOSelect logged[32];
++	static uint32_t n;
++	bool known = false;
++	for (uint32_t k = 0; k < n; k++)
++		known |= logged[k] == sel;
++	if (!known && n < 32) {
++		logged[n++] = sel;
++		LOG("gopfb: setAttribute(fb%d, '%c%c%c%c', %lx) -> success, nothing done", i, (sel >> 24) & 0xff, (sel >> 16) & 0xff,
++		    (sel >> 8) & 0xff, sel & 0xff, value);
++	}
++	return kIOReturnSuccess;  // power ('pwrs', 'dpow', 'spwr'), 'wsrv', ...: no hardware behind an inherited mode
++}
++IOReturn registerForInterruptType(void *fb, IOSelect type, void (*proc)(OSObject *, void *), OSObject *target, void *ref,
++                                  void **interruptRef) {
++	first(25, "registerForInterruptType", fb, type);
++	LOG("gopfb: registerForInterruptType(fb%d, '%c%c%c%c')", fbIndex(fb), (type >> 24) & 0xff, (type >> 16) & 0xff,
++	    (type >> 8) & 0xff, type & 0xff);
++	if (type != 'vbl ' && type != 'fstr' && type != 'txni')
++		return kIOReturnUnsupported;  // 'dci ', 'dpir', 'hdci': no hot plug on an inherited mode
++	IOSimpleLockLock(gIrqLock);
++	for (auto &q : gIrq) {
++		if (q.used)
++			continue;
++		q.fb = fb, q.type = type, q.proc = proc, q.target = target, q.ref = ref, q.on = true;
++		q.used = true;
++		IOSimpleLockUnlock(gIrqLock);
++		if (interruptRef)
++			*interruptRef = &q;
++		return kIOReturnSuccess;
++	}
++	IOSimpleLockUnlock(gIrqLock);
++	return kIOReturnNoResources;
++}
++IOReturn unregisterInterrupt(void *fb, void *ref) {
++	first(26, "unregisterInterrupt", fb);
++	auto q = static_cast<Irq *>(ref);
++	if (q < gIrq || q >= gIrq + arrsize(gIrq))
++		return kIOReturnBadArgument;
++	q->on = false;
++	q->used = false;
++	return kIOReturnSuccess;
++}
++IOReturn setInterruptState(void *fb, void *ref, UInt32 state) {
++	first(27, "setInterruptState", fb, state);
++	auto q = static_cast<Irq *>(ref);
++	if (q < gIrq || q >= gIrq + arrsize(gIrq) || !q->used)
++		return kIOReturnBadArgument;
++	q->on = state != 0;
++	return kIOReturnSuccess;
++}
++
++}  // namespace gopfb
++
++bool displayGopFbOn() { return gopfb::gOn; }
++IOReturn displayGopFbEnable() { return gopfb::enable(); }
++
++// rmbstage=3 -rmbfbstubs -rmbgopfb: route the stub virtuals. Without the argument nothing is routed.
++void displayRouteGopFb(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
++	using namespace gopfb;
++	gOn = checkKernelArgument("-rmbgopfb");
++	if (!gOn)
++		return;
++	gIrqLock = IOSimpleLockAlloc();
++#define FBSYM(s) "__ZN35AMDRadeonX6000_AmdRadeonFramebuffer" s
++	KernelPatcher::RouteRequest reqs[] {
++		{FBSYM("19getDisplayModeCountEv"), getDisplayModeCount},
++		{FBSYM("15getDisplayModesEPi"), getDisplayModes},
++		{FBSYM("28getInformationForDisplayModeEiP24IODisplayModeInformation"), getInformationForDisplayMode},
++		{FBSYM("29getPixelFormatsForDisplayModeEii"), getPixelFormatsForDisplayMode},
++		{FBSYM("15getPixelFormatsEv"), getPixelFormats},
++		{FBSYM("19getPixelInformationEiiiP18IOPixelInformation"), getPixelInformation},
++		{FBSYM("21getCurrentDisplayModeEPiS0_"), getCurrentDisplayMode},
++		{FBSYM("21getStartupDisplayModeEPiS0_"), getStartupDisplayMode},
++		{FBSYM("14setDisplayModeEii"), setDisplayMode},
++		{FBSYM("21setStartupDisplayModeEii"), setStartupDisplayMode},
++		{FBSYM("27getTimingInfoForDisplayModeEiP19IOTimingInformation"), getTimingInfoForDisplayMode},
++		{FBSYM("22validateDetailedTimingEPvy"), validateDetailedTiming},
++		{FBSYM("18setDetailedTimingsEP7OSArray"), setDetailedTimings},
++		{FBSYM("12connectFlagsEiiPj"), connectFlags},
++		{FBSYM("16getApertureRangeEi"), getApertureRange},
++		{FBSYM("25getAttributeForConnectionEijPm"), getAttributeForConnection},
++		{FBSYM("25setAttributeForConnectionEijm"), setAttributeForConnection},
++		{FBSYM("13hasDDCConnectEi"), hasDDCConnect},
++		{FBSYM("11getDDCBlockEijjjPhPy"), getDDCBlock},
++		{FBSYM("13getAppleSenseEiPjS0_S0_S0_"), getAppleSense},
++		{FBSYM("13setGammaTableEjjjPvb"), setGammaTable},
++		{FBSYM("14setCursorImageEPv"), setCursorImage},
++		{FBSYM("14setCursorStateEiib"), setCursorState},
++		{FBSYM("12getAttributeEjPm"), getAttribute, gfbOrgGetAttr},
++		{FBSYM("12setAttributeEjm"), setAttribute, gfbOrgSetAttr},
++		{FBSYM("24registerForInterruptTypeEjPFvP8OSObjectPvES1_S2_PS2_"), registerForInterruptType},
++		{FBSYM("19unregisterInterruptEPv"), unregisterInterrupt},
++		{FBSYM("17setInterruptStateEPvj"), setInterruptState},
++	};
++#undef FBSYM
++	size_t routed = 0;
++	for (auto &r : reqs) {
++		if (patcher.routeMultiple(index, &r, 1, address, size))
++			routed++;
++		else
++			LOG("gopfb: failed to route %s (err %d)", r.symbol, patcher.getError());
++		patcher.clearError();
++	}
++	gRouted = routed == arrsize(reqs) && gIrqLock;
++	LOG("gopfb: %zu of %zu framebuffer virtuals routed; enableController will %s", routed, arrsize(reqs),
++	    gRouted ? "return success once the inherited mode is read" : "keep refusing (not every route is in place)");
++	thread_t t;
++	if (gRouted && kernel_thread_start(tickThread, nullptr, &t) == KERN_SUCCESS)
++		thread_deallocate(t);
++}
++
++// stage4aOpen, before the first open: read the inherited mode (with the 1 s refresh measurement).
++void displayGopFbSample() {
++	if (gopfb::gOn && !gopfb::gMode.ok)
++		gopfb::sample(true);
++}
++
+ // Sub-stage 4a (rmbstage=3 plus -rmbfbstubs), patch 0023. Measured at the boot of 24/11 19:33: the
+ // accelerator exists but every Metal allocation sleeps in IOGraphicsAccelerator2::
+ // acceleratorWaitEnabled(). The enabled bit ([accel+0xc78] & 2, IOAcceleratorFamily2 of 15.8.1) is
+@@ -3369,6 +3870,7 @@ static void stage4aOpen(void *, wait_result_t) {
+ 	OSSafeReleaseNULL(iter);
+ 	LOG("4a: %u AmdRadeonFramebuffer services, framebuffer 0 %s", count, fb0 ? "found" : "NOT found");
+ 	gopCensus(fb0, "before open");
++	displayGopFbSample();  // patch 0028: no-op without -rmbgopfb
+ 	if (fb0 && !checkKernelArgument("-rmbnoopen")) {
+ 		auto vt = *reinterpret_cast<mach_vm_address_t **>(fb0);
+ 		size_t slot = 0;
+@@ -3380,7 +3882,7 @@ static void stage4aOpen(void *, wait_result_t) {
+ 		} else {
+ 			LOG("4a: opening framebuffer 0 (vtable slot %zu)", slot);
+ 			auto r = reinterpret_cast<IOReturn (*)(IOService *)>(vt[slot])(fb0);
+-			LOG("4a: framebuffer 0 open = %x (an error is expected: enableController is refused)", r);
++			LOG("4a: framebuffer 0 open = %x (%s)", r, displayGopFbOn() ? "-rmbgopfb: 0 expected" : "an error is expected: enableController is refused");
+ 		}
+ 	}
+ 	IOSleep(500);
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 8d7bed1..dffa234 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -261,6 +261,14 @@ static uint64_t wrapFbEnableControllerRefused(uint64_t fb, uint64_t, uint64_t, u
+ 		LOG("4a: enableController call %u of %u framebuffers: sending message 0x1b, as Apple does on the last one", calls, fbs);
+ 		sendMsg1b(ctrl, "boot");
+ 	}
++	// Patch 0028: with -rmbgopfb every stub reports success (CoreDisplay needs all of them open);
++	// fb 0 serves the inherited mode, the others are offline (display.cpp gopfb). Apple's DAL still
++	// does not run and nothing is written. Without the argument, or with a route missing, as 0027.
++	if (displayGopFbOn() && displayGopFbEnable() == kIOReturnSuccess) {
++		LOG("gopfb: AmdRadeonFramebuffer::enableController -> success without Apple's DAL (call %u, %u framebuffers, location %s)",
++		    calls, fbs, reinterpret_cast<IOService *>(fb)->getLocation() ? reinterpret_cast<IOService *>(fb)->getLocation() : "?");
++		return kIOReturnSuccess;
++	}
+ 	LOG("4a: AmdRadeonFramebuffer::enableController refused (kIOReturnUnsupported), Apple's DAL not run (call %u, %u framebuffers)", calls, fbs);
+ 	return 0xe00002c7;
+ }
+@@ -779,6 +787,7 @@ static void processFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_add
+ 		LOG("4a: framebuffer stubs kept (-rmbfbstubs); 6 write-dropping register hooks %s; enableController will be refused",
+ 		    s2WritesBlocked ? "installed" : "MISSING: controller start will be declined");
+ 		if (s2WritesBlocked) {
++			displayRouteGopFb(patcher, index, address, size);  // patch 0028: nothing without -rmbgopfb
+ 			displayStage4aOpen(patcher, index, address, size);
+ 			thread_t t;
+ 			if (kernel_thread_start(msg1bThread, nullptr, &t) == KERN_SUCCESS)
+@@ -1279,7 +1288,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0027, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
++	LOG("stage 3: kext patch 0028, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s; framebuffers %s; accelerator message 6 %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+diff --git a/src/RembrandtGfx/rmb.hpp b/src/RembrandtGfx/rmb.hpp
+index b1e3037..bd14ef7 100644
+--- a/src/RembrandtGfx/rmb.hpp
++++ b/src/RembrandtGfx/rmb.hpp
+@@ -133,6 +133,10 @@ bool mmioAvailable();
+ void quiesceIh(const char *why);
+ // Patch 0027 (-rmbgopcensus): read-only census of the display mode the firmware left lit.
+ void displayGopCensus(const char *when);
++// Patch 0028 (-rmbgopfb): the stubs serve the firmware-lit mode (routes, VBL/transaction timer).
++void displayRouteGopFb(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
++bool displayGopFbOn();
++IOReturn displayGopFbEnable();  // kIOReturnSuccess once routed and the inherited mode is usable
+ // Patch 0026: stops the interrupt ring and the MSI source if the kext started them (power handler).
+ void irqStopForShutdown(const char *why);
+ // Patch 0025: turns the interrupt rings off, whatever the stage (rmb-irq watchdog only).
+-- 
+2.39.5 (Apple Git-154)
+

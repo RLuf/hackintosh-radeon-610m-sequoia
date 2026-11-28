@@ -1,0 +1,198 @@
+From a76aef77f3e4f1211c942646a2ff9c256ca0b338 Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 19:27:04 -0800
+Subject: [PATCH 22/48] fix: 610M manda o SETUP_TMR como o Linux (endereco
+ fisico) e mede onde o CP para
+
+Conferido por desmontagem do HWLibs 15.8.1:
+- _psp_tmr_load preenche so o endereco de GPU ([psp+0xb08]) e o tamanho
+  ([psp+0xaf8]) do TMR;
+- _psp_cmd_km_buf_prep, para o comando 5, copia so esses tres campos para o
+  buffer de comando (+0x1c, +0x20, +0x24);
+- _psp_cmd_km_allocate_buf zera o buffer antes.
+Logo tmr_flags e system_phy_addr chegam ao TOS em 0.
+
+O Linux v6.12 (amdgpu_psp.c:762-784), para todo ASIC e portanto para o PSP
+13.0.8 (boot_time_tmr = false, :213-224), manda bitfield.virt_phy_addr = 1 e
+system_phy_addr = mc - vram_start + (GCMC_VM_FB_OFFSET << 24).
+
+Correcao: gancho em _psp_cmd_km_buf_prep completa o comando 5 na 610M, so
+quando o TMR esta dentro da faixa de FB que o chip informa e os tres campos
+estao em 0. Roteado a parte: se falhar, os outros ganchos ficam.
+Chave: -rmbtmrvirtonly manda o comando da Apple sem mudanca.
+Hipotese, nao confirmada: a 680M do upstream funciona sem isso.
+
+Medicao (so leitura), pedida pelo revisor do 0021:
+- s3Sample ganha duas linhas: CP_STALLED_STAT1/2/3, CP_BUSY_STAT, CPF/CPC
+  stalled e busy, registradores do DMA do CP (ME e PFP: controle, origem,
+  destino, comando), CP_DMA_CNTL, CP_DMA_READ_TAGS; AGP bot/top/base,
+  SYSTEM_APERTURE_DEFAULT_ADDR, PROTECTION_FAULT_CNTL2, INVALIDATE_ENG0
+  REQ/ACK. Nao le INVALIDATE_ENG*_SEM (a leitura toma o semaforo).
+- psp-km: LOAD_IP_FW mostra o endereco e o tamanho de cada firmware.
+
+Corrige o criterio do 0021: o HWLibs grava 0x16f8 mesmo com valor 0; a
+escrita pulada so e nula quando o valor e igual ao que o registrador ja tem.
+A linha de log agora diz qual dos dois casos ocorreu.
+
+Confirma: CP_STAT 0 e BOOTLOAD com bit 31 depois do AUTOLOAD_RLC.
+Se falhar: a linha s3 "CP_STALLED ... DMA_ME ... dst" de "after psp_hw_init"
+diz qual DMA esta preso e para qual endereco.
+Para: panico, perda de SSH, RESTORE MISMATCH, "failed to route".
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSo88Xro5AsvDqwXSnr
+---
+ src/RembrandtGfx/firmware.cpp   | 70 ++++++++++++++++++++++++++++++++-
+ src/RembrandtGfx/kern_start.cpp | 23 +++++++++--
+ 2 files changed, 88 insertions(+), 5 deletions(-)
+
+diff --git a/src/RembrandtGfx/firmware.cpp b/src/RembrandtGfx/firmware.cpp
+index 92f2442..3e778df 100644
+--- a/src/RembrandtGfx/firmware.cpp
++++ b/src/RembrandtGfx/firmware.cpp
+@@ -232,10 +232,66 @@ uint64_t wrapCapCheck(uint64_t psp, uint64_t type, uint64_t c, uint64_t d, uint6
+ 	return r;
+ }
+ 
++// Patch 0022. SETUP_TMR as Linux sends it for PSP 13.0.8.
++// HWLibs' _psp_tmr_load fills only the GPU address and the size, and _psp_cmd_km_buf_prep copies
++// just those three dwords into the command buffer (cmd 5: +0x1c, +0x20, +0x24), which
++// _psp_cmd_km_allocate_buf has zeroed. So tmr_flags and system_phy_addr reach the TOS as 0.
++// Linux v6.12 psp_prep_tmr_cmd_buf (amdgpu_psp.c:762-784) sets, for every ASIC and so for MP0
++// 13.0.8 (boot_time_tmr = false, :213-224): bitfield.virt_phy_addr = 1 and system_phy_addr =
++// amdgpu_gmc_vram_pa = mc - vram_start + (GCMC_VM_FB_OFFSET << 24). On a UMA chip the TMR lives in
++// system RAM, and the physical address is the only one that needs no GPU-side translation.
++// Applied only on the 610M, only when the TMR lies inside the FB range the chip reports and the
++// three fields are still 0. -rmbtmrvirtonly: send Apple's command untouched.
++// Command buffer layout (Linux psp_gfx_if.h, struct psp_gfx_cmd_resp): dword 2 = cmd_id, 7/8 =
++// buf_phy_addr lo/hi, 9 = buf_size, 10 = tmr_flags (bit 1 = virt_phy_addr), 11/12 = system_phy_addr.
++mach_vm_address_t orgPspCmdKmBufPrep;
++uint64_t wrapPspCmdKmBufPrep(uint64_t psp, uint64_t inBuf, uint64_t handle, uint64_t d, uint64_t e, uint64_t f) {
++	auto r = reinterpret_cast<Fn6>(orgPspCmdKmBufPrep)(psp, inBuf, handle, d, e, f);
++	if ((r & 0xFFFFFFFF) || !psp || !inBuf || !handle || *reinterpret_cast<const uint32_t *>(inBuf) != 5)
++		return r;
++	uint32_t slot = *reinterpret_cast<const uint32_t *>(handle);
++	if (slot > 0xf || !mmioAvailable())
++		return r;
++	auto buf = *reinterpret_cast<uint32_t **>(psp + 0x760 + slot * 0x38ull);
++	if (!buf || buf[2] != 5)
++		return r;
++	constexpr uint32_t G0 = 0x1260;
++	uint64_t mc = (static_cast<uint64_t>(buf[8]) << 32) | buf[7];
++	uint64_t tmrSize = buf[9];
++	uint64_t fbBase = static_cast<uint64_t>(mmioRead(G0 + 0x16fc) & 0xFFFFFF) << 24;
++	uint64_t fbTop = (static_cast<uint64_t>(mmioRead(G0 + 0x16fd) & 0xFFFFFF) << 24) | 0xFFFFFF;
++	uint64_t fbOff = static_cast<uint64_t>(mmioRead(G0 + 0x16e7) & 0xFFFFFF) << 24;
++	bool inFb = tmrSize && fbTop > fbBase && mc >= fbBase && mc + tmrSize - 1 <= fbTop;
++	bool untouched = !buf[10] && !buf[11] && !buf[12];
++	uint64_t pa = mc - fbBase + fbOff;
++	// The header asks for a 4 KB aligned address. This hook also runs for _psp_cmd_km_submit_rt
++	// (the retry path), which prepares the same command again.
++	bool apply = gcHwVersion() == 0xa0307 && inFb && fbOff && untouched && !(pa & 0xfff) &&
++	             !checkKernelArgument("-rmbtmrvirtonly");
++	LOG("psp-km: SETUP_TMR as HWLibs built it: mc %x_%08x size %#x flags %x sys_pa %x_%08x; mc %% size %#llx; FB %x_%08x-%x_%08x offset %x_%08x",
++	    buf[8], buf[7], buf[9], buf[10], buf[12], buf[11], tmrSize ? mc % tmrSize : 0,
++	    static_cast<uint32_t>(fbBase >> 32), static_cast<uint32_t>(fbBase), static_cast<uint32_t>(fbTop >> 32),
++	    static_cast<uint32_t>(fbTop), static_cast<uint32_t>(fbOff >> 32), static_cast<uint32_t>(fbOff));
++	if (apply) {
++		buf[10] = 2;  // bitfield.virt_phy_addr (bit 1; bit 0 is sriov_enabled)
++		buf[11] = static_cast<uint32_t>(pa);
++		buf[12] = static_cast<uint32_t>(pa >> 32);
++		LOG("psp-km: SETUP_TMR 610M: sent as Linux does: virt_phy_addr=1 sys_pa %x_%08x", buf[12], buf[11]);
++	} else {
++		LOG("psp-km: SETUP_TMR left as HWLibs built it (610M %d, inside FB %d, FB offset set %d, fields zero %d, -rmbtmrvirtonly %d)",
++		    gcHwVersion() == 0xa0307, inFb, fbOff != 0, untouched, checkKernelArgument("-rmbtmrvirtonly"));
++	}
++	return r;
++}
++
+ mach_vm_address_t orgPspCmdKmSubmit;
+ uint64_t wrapPspCmdKmSubmit(uint64_t psp, uint64_t inBuf, uint64_t outResp, uint64_t d, uint64_t e, uint64_t f) {
+ 	uint32_t cmd = inBuf ? *reinterpret_cast<const uint32_t *>(inBuf) : 0;
+ 	uint32_t fwType = (inBuf && cmd == 6) ? *reinterpret_cast<const uint32_t *>(inBuf + 0x10) : 0;
++	// Where each firmware sits (GPU address) and its size: fields +4, +8, +0xc of the request.
++	uint32_t fwLo = (inBuf && cmd == 6) ? *reinterpret_cast<const uint32_t *>(inBuf + 0x4) : 0;
++	uint32_t fwHi = (inBuf && cmd == 6) ? *reinterpret_cast<const uint32_t *>(inBuf + 0x8) : 0;
++	uint32_t fwSize = (inBuf && cmd == 6) ? *reinterpret_cast<const uint32_t *>(inBuf + 0xc) : 0;
+ 	auto r = reinterpret_cast<Fn6>(orgPspCmdKmSubmit)(psp, inBuf, outResp, d, e, f);
+ 	// The submit's return is 0 even when the TOS refuses the command; the TOS answer is the first
+ 	// dword of the response (status, then session id at +4: _psp_asd_load reads the id from there).
+@@ -248,8 +304,8 @@ uint64_t wrapPspCmdKmSubmit(uint64_t psp, uint64_t inBuf, uint64_t outResp, uint
+ 			    r & 0xFFFFFFFF, tos, mmioRead(0xA000 + 0x4c00), mmioRead(0xA000 + 0x4c04), mmioRead(0xA000 + 0x4e8d),
+ 			    mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4));
+ 		} else if (cmd == 6) {
+-			LOG("psp-km: LOAD_IP_FW type=%u ret=%llx tos=%x; CP_STAT=%x GRBM=%x", fwType, r & 0xFFFFFFFF, tos,
+-			    mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4));
++			LOG("psp-km: LOAD_IP_FW type=%u ret=%llx tos=%x; CP_STAT=%x GRBM=%x; fw mc %x_%08x size %#x", fwType,
++			    r & 0xFFFFFFFF, tos, mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4), fwHi, fwLo, fwSize);
+ 		} else {
+ 			LOG("psp-km: cmd=%#x ret=%llx tos=%x; CP_STAT=%x GRBM=%x", cmd, r & 0xFFFFFFFF, tos,
+ 			    mmioRead(0x1260 + 0x0f40), mmioRead(0x1260 + 0x0da4));
+@@ -331,6 +387,16 @@ void firmwareRoute(KernelPatcher &patcher, size_t index, mach_vm_address_t addre
+ 	if (!gFwHooksOk)
+ 		LOG("fw: failed to route PSP firmware hooks (err %d)", patcher.getError());
+ 	patcher.clearError();
++	// Patch 0022: routed on its own, so a failure here leaves the three hooks above in place.
++	if (rmbStage() == 3) {
++		KernelPatcher::RouteRequest tmrReq[] {
++			{"_psp_cmd_km_buf_prep", wrapPspCmdKmBufPrep, orgPspCmdKmBufPrep},
++		};
++		bool tmrOk = patcher.routeMultiple(index, tmrReq, 1, address, size);
++		LOG("fw: SETUP_TMR hook (_psp_cmd_km_buf_prep) %s; tmr %s", tmrOk ? "installed" : "NOT installed",
++		    checkKernelArgument("-rmbtmrvirtonly") ? "virtual only (-rmbtmrvirtonly)" : "virtual + physical, as Linux");
++		patcher.clearError();
++	}
+ 
+ 	for (auto &s : subs) {
+ 		auto desc = patcher.solveSymbol<uint8_t *>(index, s.symbol, address, size);
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 639c629..42c6091 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -779,6 +779,19 @@ static void s3Sample(const char *when) {
+ 	    mmioRead(G0 + 0x15bc), mmioRead(G0 + 0x15bd), mmioRead(G0 + 0x15be), mmioRead(G0 + 0x15d4),
+ 	    mmioRead(G0 + 0x15bf), mmioRead(G0 + 0x1703), mmioRead(G0 + 0x15c4), mmioRead(G0 + 0x13de),
+ 	    mmioRead(G0 + 0x100f), mmioRead(G0 + 0x1010), mmioRead(G1 + 0x4ca0));
++	// Patch 0022, read-only: where the command processor is stalled, which DMA it holds and to
++	// which address, and the system aperture (Linux gfxhub_v2_1_init_system_aperture_regs).
++	// GCVM_INVALIDATE_ENG*_SEM (0x160d) is NOT read: reading it takes the semaphore.
++	LOG("s3 %s: CP_STALLED 1 %x 2 %x 3 %x CP_BUSY %x CPF_STALLED %x CPF_BUSY %x CPC_STALLED %x CPC_BUSY %x; DMA_ME ctl %x src %x_%08x dst %x_%08x cmd %x; DMA_PFP ctl %x src %x_%08x dst %x_%08x cmd %x; DMA_CNTL %x TAGS %x",
++	    when, mmioRead(G0 + 0x0f3d), mmioRead(G0 + 0x0f3e), mmioRead(G0 + 0x0f3c), mmioRead(G0 + 0x0f3f),
++	    mmioRead(G0 + 0x0e29), mmioRead(G0 + 0x0e28), mmioRead(G0 + 0x0e26), mmioRead(G0 + 0x0e25),
++	    mmioRead(G1 + 0x2078), mmioRead(G1 + 0x2081), mmioRead(G1 + 0x2080), mmioRead(G1 + 0x2083),
++	    mmioRead(G1 + 0x2082), mmioRead(G1 + 0x2084), mmioRead(G1 + 0x2077), mmioRead(G1 + 0x2086),
++	    mmioRead(G1 + 0x2085), mmioRead(G1 + 0x2088), mmioRead(G1 + 0x2087), mmioRead(G1 + 0x2089),
++	    mmioRead(G1 + 0x208a), mmioRead(G1 + 0x208b));
++	LOG("s3 %s: AGP bot %x top %x base %x SYSAP_DEFAULT %x_%08x FAULT_CNTL2 %x INVALIDATE_ENG0 req %x ack %x", when,
++	    mmioRead(G0 + 0x16ff), mmioRead(G0 + 0x16fe), mmioRead(G0 + 0x1700), mmioRead(G0 + 0x16e9),
++	    mmioRead(G0 + 0x16e8), mmioRead(G0 + 0x15c5), mmioRead(G0 + 0x161f), mmioRead(G0 + 0x1631));
+ }
+ 
+ static mach_vm_address_t org_get_uma_physical_fb_offset;
+@@ -974,7 +987,7 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0021, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s",
++	LOG("stage 3: kext patch 0022, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s; gart clean %s; utcl2 harvest %s",
+ 	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
+ 	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
+ 	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped",
+@@ -1139,8 +1152,12 @@ static uint64_t wrap_gc_10_3_1_initialize_utcl2_bypass_groups(uint64_t a, uint64
+ 	uint32_t yc = can ? mmioRead(G0 + 0x16f8) : 0, gen = can ? mmioRead(G0 + 0x16fa) : 0;
+ 	uint32_t dis = ((efuse | user) >> 8) & 3, want = (dis & 1 ? 3u : 0u) | (dis & 2 ? 0xcu : 0u);
+ 	if (gcHwVersion() == 0xa0307 && !checkKernelArgument("-rmbutcl2harvest")) {
+-		LOG("gc: 610M: UTCL2 harvest bypass groups NOT programmed (Linux does it only for GC 10.3.1/10.3.3); CC_SA_DIS %x USER_SA_DIS %x -> HWLibs would write %x; register now yc(16f8) %x gen(16fa) %x",
+-		    efuse, user, want, yc, gen);
++		// HWLibs writes the register even when the value is 0, so the skipped write is a no-op only
++		// when it equals what 0x16f8 holds now. 0x16f8 is GCMC_VM_XGMI_LFB_SIZE in the 10.3.x
++		// header; the harvest name comes from Linux's local YELLOW_CARP define. The same function
++		// is also reached from _vm_10_3_3_event_notification (events 4, 6, 9): this line repeats.
++		LOG("gc: 610M: UTCL2 harvest bypass groups NOT programmed (Linux does it only for GC 10.3.1/10.3.3); CC_SA_DIS %x USER_SA_DIS %x -> HWLibs would write %x to 0x16f8, which holds %x (%s); gen(16fa) %x",
++		    efuse, user, want, yc, want == yc ? "same value: skipping changes nothing" : "DIFFERENT: skipping changes the chip state", gen);
+ 		return 0;
+ 	}
+ 	auto r = reinterpret_cast<Fn6>(org_gc_10_3_1_initialize_utcl2_bypass_groups)(a, b, c, d, e, f);
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,123 @@
+From 23e8057881ad577ec3075357c674e55cdc08598a Mon Sep 17 00:00:00 2001
+From: fzmac <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 18:02:26 -0800
+Subject: [PATCH 17/48] fix: 610M segue o Linux em tres pontos: sem ASD do Navi
+ 23, sem remapeamento CAM, golden 10.3.7
+
+Tres correcoes com causa conhecida, cada uma com chave que devolve o
+comportamento da Apple para o Navi 23:
+
+(a) _psp_asd_load deixa de enviar o ASD do Navi 23. A TOS da PSP 13.0.8 o
+    recusa em todo boot do estagio 3 (evento 0x140402, tag 0x7). O Linux nao
+    tem ASD separado para 13.0.8 e psp_asd_initialize devolve 0 sem ele.
+    Chave: -rmbsendasd.
+(b) _gc_check_grbm_cam_remap_10_3 devolve 1 sem tocar em nada. O caminho do
+    Navi 23 programa GRBM_CAM_INDEX, que nesta APU e barrado (RSMU em 0x3e810).
+    O Linux devolve true para GC 10.3.1/3/6/7. Chave: -rmbcamcheck.
+(c) gancho em _gc_golden_settings_execution reaplica a tabela golden do GC
+    10.3.7 logo depois que a Apple grava a do Navi 23 (GL2A/GL2C ffffffcf).
+
+Hipotese para (a): a recusa do ASD antes dos firmwares de IP atrapalha o
+autoload do RLC. Confirma: BOOTLOAD com bit 31 e CP_STAT = 0 depois do
+AUTOLOAD_RLC, sem evento 0x140402. Refuta: BOOTLOAD = 0 de novo.
+(b) e (c) so rodam depois que a checagem de ucode passar.
+Para: panico, perda de SSH, RESTORE MISMATCH, "failed to route" ou erro novo
+do PSP.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KLHgSo88Xro5AsvDqwXSnr
+---
+ src/RembrandtGfx/kern_start.cpp | 56 +++++++++++++++++++++++++++++++--
+ 1 file changed, 53 insertions(+), 3 deletions(-)
+
+diff --git a/src/RembrandtGfx/kern_start.cpp b/src/RembrandtGfx/kern_start.cpp
+index 6b846a4..8d45767 100644
+--- a/src/RembrandtGfx/kern_start.cpp
++++ b/src/RembrandtGfx/kern_start.cpp
+@@ -946,8 +946,10 @@ static uint64_t stage3_ttl_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	}
+ 	gStage3Armed = true;
+ 	LOG("stage 3: preflight passed, hardware init allowed");
+-	LOG("stage 3: kext patch 0016, built " __DATE__ " " __TIME__ "; forced RLC accept %s",
+-	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off");
++	LOG("stage 3: kext patch 0017, built " __DATE__ " " __TIME__ "; forced RLC accept %s; asd %s; cam check %s",
++	    checkKernelArgument("-rmbacceptrlc") ? "ON (-rmbacceptrlc)" : "off",
++	    checkKernelArgument("-rmbsendasd") ? "sent (-rmbsendasd)" : "not sent",
++	    checkKernelArgument("-rmbcamcheck") ? "Apple's (-rmbcamcheck)" : "skipped");
+ 	smuStage3BeforeHwInit();
+ 	s3Sample("before ttl_hw_init");
+ 	LOG(">> ttl_hw_init(%llx, %llx)", a, b);
+@@ -976,6 +978,50 @@ static uint64_t stage3_psp_hw_init(uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 	return (r & 0xFFFFFFFF) ? r : 1;
+ }
+ 
++// 610M fixes that follow what Linux v6.12 does for GC 10.3.7 / MP0 13.0.8 (patch 0017).
++// Each has a boot-arg that restores Apple's Navi 23 behaviour.
++
++// (a) _psp_asd_load sends the Navi 23 ASD embedded in HWLibs (_psp_asd_bin, command 0x4). The
++// 13.0.8 TOS refuses it in every stage 3 boot (event 0x140402, tag 0x7). Linux has no separate ASD
++// for 13.0.8 (psp_v13_0.c loads only the TOC and the TA bin) and psp_asd_initialize returns 0 when
++// there is none. Do the same: report success without sending. -rmbsendasd: send it as Apple does.
++static mach_vm_address_t org_psp_asd_load;
++static uint64_t wrap_psp_asd_load(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	if (gcHwVersion() == 0xa0307 && !checkKernelArgument("-rmbsendasd")) {
++		LOG("psp: 610M: Navi 23 ASD not sent (PSP 13.0.8 has no separate ASD), returning 0");
++		return 0;
++	}
++	auto r = reinterpret_cast<Fn6>(org_psp_asd_load)(a, b, c, d, e, f);
++	LOG("psp: asd_load = %llx", r & 0xFFFFFFFF);
++	return r;
++}
++
++// (b) _gc_check_grbm_cam_remap_10_3 writes a test pattern and, when it does not read back, the
++// Navi 23 path programs GRBM_CAM_INDEX/DATA. On this APU that access is refused (RSMU security
++// violation at 0x3e810 = GRBM_CAM_INDEX). Linux gfx_v10_0_check_grbm_cam_remapping returns true
++// for 10.3.1/3/6/7 without touching anything. Do the same. -rmbcamcheck: run Apple's check.
++static mach_vm_address_t org_gc_check_grbm_cam_remap_10_3;
++static uint64_t wrap_gc_check_grbm_cam_remap_10_3(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	if (gcHwVersion() == 0xa0307 && !checkKernelArgument("-rmbcamcheck")) {
++		LOG("gc: 610M: GRBM CAM remap check skipped, returning 1 (remapped), as Linux does for GC 10.3.7");
++		return 1;
++	}
++	auto r = reinterpret_cast<Fn6>(org_gc_check_grbm_cam_remap_10_3)(a, b, c, d, e, f);
++	LOG("gc: check_grbm_cam_remap = %llx", r & 0xFF);
++	return r;
++}
++
++// (c) _gc_hw_init_internal calls _gc_golden_settings_execution directly, after the ucode check;
++// it writes the Navi 23 table (GL2A/GL2C_ADDR_MATCH_MASK 0xffffffcf). Put the GC 10.3.7 values
++// back right after it, on the same thread, instead of leaving it to the guard thread.
++static mach_vm_address_t org_gc_golden_settings_execution;
++static uint64_t wrap_gc_golden_settings_execution(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
++	auto r = reinterpret_cast<Fn6>(org_gc_golden_settings_execution)(a, b, c, d, e, f);
++	LOG("golden: after gc_golden_settings_execution (%llx)", r & 0xFFFFFFFF);
++	applyGcGolden();
++	return r;
++}
++
+ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+ 	bool s2 = rmbStage() == 2, s3 = rmbStage() == 3;
+ 	KernelPatcher::RouteRequest requests[] {
+@@ -1062,6 +1108,10 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 			{"__ZN14AmdTtlServices14cosWaitForFuncEPvP18cos_wait_for_input", wrap_cosWaitForFunc, org_cosWaitForFunc},
+ 			{"_gc_cos_write_amdlog", wrap_gc_cos_write_amdlog, org_gc_cos_write_amdlog},
+ 			{"_gvm_cos_write_amdlog", wrap_gvm_cos_write_amdlog, org_gvm_cos_write_amdlog},
++			// 610M fixes (patch 0017), same prologue check.
++			{"_psp_asd_load", wrap_psp_asd_load, org_psp_asd_load},
++			{"_gc_check_grbm_cam_remap_10_3", wrap_gc_check_grbm_cam_remap_10_3, org_gc_check_grbm_cam_remap_10_3},
++			{"_gc_golden_settings_execution", wrap_gc_golden_settings_execution, org_gc_golden_settings_execution},
+ 		};
+ 		unsigned routed = 0;
+ 		for (auto &r : diag) {
+@@ -1071,7 +1121,7 @@ static void processHWLibs(KernelPatcher &patcher, size_t index, mach_vm_address_
+ 				LOG("failed to route %s (err %d)", r.symbol, patcher.getError());
+ 			patcher.clearError();
+ 		}
+-		LOG("stage 3: %u of 3 measurement hooks installed (wait, gc amdlog, gvm amdlog)", routed);
++		LOG("stage 3: %u of 6 stage-3 hooks installed (3 measurement, 3 fixes: asd, cam, golden)", routed);
+ 		LOG("stage 3: ttl_hw_init runs only if the preflight passes; wake POST hooks not installed");
+ 	}
+ 	LOG("HWLibs hooks installed");
+-- 
+2.39.5 (Apple Git-154)
+
